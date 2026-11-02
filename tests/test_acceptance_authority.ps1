@@ -1,6 +1,7 @@
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 $reviewer = Get-Content (Join-Path $root 'skills/reviewer/SKILL.md') -Raw
+$orchestrator = Get-Content (Join-Path $root 'skills/orchestrator/SKILL.md') -Raw
 $issue = Get-Content (Join-Path $root '.github/ISSUE_TEMPLATE/task.yml') -Raw
 $pr = Get-Content (Join-Path $root '.github/pull_request_template.md') -Raw
 
@@ -11,4 +12,7 @@ foreach ($field in @('reviewed_code_commit','acceptance_base_commit','record_com
     if ($pr -notmatch [regex]::Escape($field)) { throw "PR template missing acceptance field $field" }
 }
 if ($reviewer -notmatch '不得增加.*Issue.*验收') { throw 'Reviewer must not add acceptance requirements beyond the Issue contract' }
+foreach ($functionName in @('Test-AgentRelayReviewValidity','Test-AgentRelayMergeBlocked','fail closed')) {
+    if ($orchestrator -notmatch [regex]::Escape($functionName)) { throw "Orchestrator must execute and enforce $functionName" }
+}
 Write-Output 'PASS acceptance authority'

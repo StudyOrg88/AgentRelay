@@ -33,9 +33,9 @@ description: Drive Superpowers planning and distribute approved coding tasks as 
 
 ## 自动验收与合并
 
-人工调用 `agentrelay-orchestrator` 时，读取 PR 当前 HEAD、最新 Reviewer 评论、关联 Issue 和 Acceptance schema v1 记录。有效评论必须包含 `agentrelay_review`、`result: PASS`、`reviewed_code_commit`、`acceptance_base_commit`、`record_commit_parent`、`reviewer`、`session_id`、`reviewed_at`、`findings` 和 `evidence`。从 `reviewed_code_commit` 到 PR HEAD 仅有 `acceptance/` 或 `docs/acceptance-records/` 变化时保留代码审查；出现任何其他路径变化时要求在另一设备新会话重新触发 Reviewer。验收记录不得自报其自身提交 SHA。
+人工调用 `agentrelay-orchestrator` 时，读取 PR 当前 HEAD、最新 Reviewer 评论、关联 Issue 和 Acceptance schema v1 记录。有效评论必须包含 `agentrelay_review`、`result: PASS`、`reviewed_code_commit`、`acceptance_base_commit`、`record_commit_parent`、`reviewer`、`session_id`、`reviewed_at`、`findings` 和 `evidence`。点检任何自动门槛前，必须在仓库根目录加载 `scripts/acceptance-policy.ps1` 并调用 `Test-AgentRelayReviewValidity -Repository . -CurrentTask <task_id> -SchemaPath docs/acceptance-schema-v1.json -ReviewedCodeCommit <reviewed_code_commit> -PullRequestHead <current_head>`。仅 `acceptance/<task_id>.v1.json` 可作为当前任务记录；内容必须通过 v1 schema、`task_id` 必须匹配，记录中的 `reviewed_code_commit` 必须与 Reviewer 评论一致，父提交必须与 Git 中最近一次写入该记录的提交一致。同一路径的记录更新只有在最终记录全部验证通过时才保留代码审查；reviewed commit 之后若有记录删除事件，即使随后重建也必须重审。其他任务记录或任何非规范路径变化同样要求重审。验收记录不得自报其自身提交 SHA。
 
-主控逐条核对 Issue 验收标准的自动证据，并检查目标项目分支保护中所有 required CI。只有 `owner_task` 等于当前 `task_id`、`merge_blocking: true` 且 `status` 不是 `passed` 的验收项阻止合并；非阻断项和其他任务的验收项只记录状态。所有阻断项通过、PR 仍开放且无冲突时，使用 Merge Bot 执行 `gh pr merge --squash`，写入合并证据并将 Issue 标记 `task:done`。
+主控逐条核对 Issue 验收标准的自动证据，并检查目标项目分支保护中所有 required CI。调用 `Test-AgentRelayMergeBlocked -CurrentTask <task_id> -Repository . -PullRequestHead <current_head> -SchemaPath docs/acceptance-schema-v1.json`；该函数从 PR HEAD 的 Git 对象读取唯一规范记录 `acceptance/<task_id>.v1.json`，复核 schema、任务归属、记录真实父提交和代码审查有效性。验证失败、文件缺失或格式错误均 fail closed 并禁止合并。只有 `owner_task` 等于当前 `task_id`、`merge_blocking: true` 且 `status` 不是 `passed` 的验收项阻止合并；非阻断项和其他任务的验收项只记录状态。所有阻断项通过、PR 仍开放且无冲突时，使用 Merge Bot 执行 `gh pr merge --squash`，写入合并证据并将 Issue 标记 `task:done`。
 
 任何门槛失败、格式错误、权限不足、网络错误或 API 失败都禁止合并；主控在 PR 写入结构化失败评论，保留 `task:review`。下一次人工调用 Skill 时读取失败评论并重新检查、重试。这里不是定时任务、Webhook 或自动唤醒。
 
