@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agentrelay.dev/schemas/acceptance-v1.json",
+  "title": "AgentRelay acceptance record v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "task_id",
+    "reviewed_code_commit",
+    "acceptance_base_commit",
+    "record_commit_parent",
+    "items"
+  ],
+  "properties": {
+    "schema_version": { "const": "acceptance/v1" },
+    "task_id": { "type": "string", "minLength": 1 },
+    "reviewed_code_commit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "acceptance_base_commit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "record_commit_parent": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "items": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "status", "merge_blocking", "evidence_type", "accepted_evidence", "rejected_evidence", "owner_task"],
+        "properties": {
+          "id": { "type": "string", "minLength": 1 },
+          "status": { "enum": ["pending", "passed", "failed", "not_applicable"] },
+          "merge_blocking": { "type": "boolean" },
+          "evidence_type": { "enum": ["command", "artifact", "manual", "ci"] },
+          "accepted_evidence": { "type": "array", "items": { "type": "string" } },
+          "rejected_evidence": { "type": "array", "items": { "type": "string" } },
+          "owner_task": { "type": "string", "minLength": 1 }
+        }
+      }
+    }
+  }
+}

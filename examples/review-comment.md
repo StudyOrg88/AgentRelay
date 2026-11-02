@@ -6,7 +6,9 @@
 ```yaml
 agentrelay_review:
   result: PASS
-  commit_sha: abc1234
+  reviewed_code_commit: 1234567890abcdef1234567890abcdef12345678
+  acceptance_base_commit: 1234567890abcdef1234567890abcdef12345678
+  record_commit_parent: 234567890abcdef1234567890abcdef123456789
   reviewer: reviewer-bot
   session_id: device-b-20261022-001
   reviewed_at: 2026-10-22T12:00:00Z

@@ -20,4 +20,10 @@ Closes #
 
 ## AgentRelay Reviewer
 
-Reviewer 结果必须包含当前 PR HEAD SHA 的 `agentrelay_review` YAML 字段。新提交后必须重新触发 Reviewer。
+Reviewer 结果必须包含 `agentrelay_review` YAML，并记录：
+
+- `reviewed_code_commit`：实际审查的代码提交。
+- `acceptance_base_commit`：本版验收材料的代码基线。
+- `record_commit_parent`：记录提交的父提交；记录不得自报自身提交 SHA。
+
+仅验收材料提交不使代码审查失效；代码或配置变化必须重新触发 Reviewer。

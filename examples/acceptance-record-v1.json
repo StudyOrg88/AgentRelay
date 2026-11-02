@@ -1,0 +1,18 @@
+{
+  "schema_version": "acceptance/v1",
+  "task_id": "task-acceptance-contract",
+  "reviewed_code_commit": "1234567890abcdef1234567890abcdef12345678",
+  "acceptance_base_commit": "234567890abcdef1234567890abcdef123456789",
+  "record_commit_parent": "34567890abcdef1234567890abcdef1234567890",
+  "items": [
+    {
+      "id": "contract-tests",
+      "status": "passed",
+      "merge_blocking": true,
+      "evidence_type": "command",
+      "accepted_evidence": ["pwsh tests/test_acceptance_contract.ps1: PASS"],
+      "rejected_evidence": [],
+      "owner_task": "task-acceptance-contract"
+    }
+  ]
+}

@@ -27,7 +27,17 @@ body:
     validations: { required: true }
   - type: textarea
     id: acceptance
-    attributes: { label: 验收标准 }
+    attributes:
+      label: 验收标准
+      description: 每项必须填写 status、merge_blocking、evidence_type、accepted_evidence、rejected_evidence、owner_task。
+      placeholder: |
+        - id: contract-tests
+          status: pending
+          merge_blocking: true
+          evidence_type: command
+          accepted_evidence: []
+          rejected_evidence: []
+          owner_task: task-id
     validations: { required: true }
   - type: textarea
     id: tests
