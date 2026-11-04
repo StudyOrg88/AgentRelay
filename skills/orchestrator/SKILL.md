@@ -33,13 +33,44 @@ description: Drive Superpowers planning and distribute approved coding tasks as 
 
 ## 自动验收与合并
 
-人工调用 `agentrelay-orchestrator` 时，读取 PR 当前 HEAD、最新 Reviewer 评论、关联 Issue 和 Acceptance schema v1 记录。有效评论必须包含 `agentrelay_review`、`result: PASS`、`reviewed_code_commit`、`acceptance_base_commit`、`record_commit_parent`、`reviewer`、`session_id`、`reviewed_at`、`findings` 和 `evidence`。点检任何自动门槛前，必须在仓库根目录加载 `scripts/acceptance-policy.ps1` 并调用 `Test-AgentRelayReviewValidity -Repository . -CurrentTask <task_id> -SchemaPath docs/acceptance-schema-v1.json -ReviewedCodeCommit <reviewed_code_commit> -PullRequestHead <current_head>`。仅 `acceptance/<task_id>.v1.json` 可作为当前任务记录；内容必须通过 v1 schema、`task_id` 必须匹配，记录中的 `reviewed_code_commit` 必须与 Reviewer 评论一致，父提交必须与 Git 中最近一次写入该记录的提交一致。同一路径的记录更新只有在最终记录全部验证通过时才保留代码审查；reviewed commit 之后若有记录删除事件，即使随后重建也必须重审。其他任务记录或任何非规范路径变化同样要求重审。验收记录不得自报其自身提交 SHA。
+本技能的当前记录契约是 Acceptance v1：规范路径为 `acceptance/<task_id>.v1.json`，`schema_version` 必须为 `acceptance/v1`，逐项字段由 `docs/acceptance-schema-v1.json` 定义。历史记录、旧格式文件或旧评论只作迁移背景，不得当作 v1 记录，也不得推断为 v1 或臆造缺失字段、默认状态或版本。旧任务要参与自动验收时，必须有新增的 v1 记录逐项映射 Issue 原有验收标准；不得静默改写 Issue 或已批准计划。若目标仓库没有该 schema、没有兼容的规范记录，schema 不匹配或尚无明确支持的迁移格式，停止自动合并并报告不兼容；不得要求仓库先接受一个未定义的 schema 版本。
 
-主控逐条核对 Issue 验收标准的自动证据，并检查目标项目分支保护中所有 required CI。调用 `Test-AgentRelayMergeBlocked -CurrentTask <task_id> -Repository . -PullRequestHead <current_head> -SchemaPath docs/acceptance-schema-v1.json`；该函数从 PR HEAD 的 Git 对象读取唯一规范记录 `acceptance/<task_id>.v1.json`，复核 schema、任务归属、记录真实父提交和代码审查有效性。验证失败、文件缺失或格式错误均 fail closed 并禁止合并。只有 `owner_task` 等于当前 `task_id`、`merge_blocking: true` 且 `status` 不是 `passed` 的验收项阻止合并；非阻断项和其他任务的验收项只记录状态。所有阻断项通过、PR 仍开放且无冲突时，使用 Merge Bot 执行 `gh pr merge --squash`，写入合并证据并将 Issue 标记 `task:done`。
+所有验收判断绑定到 PR 的当前完整 HEAD SHA。先取得并校验完整 SHA，再用该 SHA 对应的 Git 对象读取规范记录和 schema（例如 `git show <head>:acceptance/<task_id>.v1.json`、`git show <head>:docs/acceptance-schema-v1.json`）；不得用工作区未提交文件、默认分支副本或其他提交的文件代替。确认对象存在、JSON 可解析、schema 版本受支持、规范路径唯一、`task_id` 匹配，并且每项包含 `owner_task`、`merge_blocking`、`status`。用 Git 提交图核验 `record_commit_parent` 等于最近一次写入规范记录的提交的真实第一父提交；记录不得自报自身提交 SHA。Reviewer PASS 必须完整包含 `agentrelay_review`、`result: PASS`、`reviewed_code_commit`、`acceptance_base_commit`、`record_commit_parent`、`reviewer`、`session_id`、`reviewed_at`、`findings` 和 `evidence`。评论中的 `reviewed_code_commit` 必须是完整 SHA、存在于对象库、为当前 HEAD 的祖先，并与 HEAD 记录中的值一致。
+
+在运行策略前，确认目标仓库根目录有 `scripts/acceptance-policy.ps1`，并检查其中两个函数的真实签名与返回契约；不能因技能示例写了调用就假设函数存在。review 校验调用契约为：
+
+```powershell
+Test-AgentRelayReviewValidity -Repository . -CurrentTask <task_id> -SchemaPath <已从当前HEAD核验的schema文件> -ReviewedCodeCommit <完整reviewed_code_commit> -PullRequestHead <完整current_head>
+```
+
+该函数应返回对象：有效时 `valid = $true`、`requires_review = $false`；无效、缺记录或无法验证时 `valid = $false`、`requires_review = $true`，并给出原因。仅当对象有效且评论字段/结果也通过独立校验时 review 才有效。合并阻断判断调用契约为：
+
+```powershell
+Test-AgentRelayMergeBlocked -Repository . -CurrentTask <task_id> -SchemaPath <已从当前HEAD核验的schema文件> -PullRequestHead <完整current_head>
+```
+
+该函数必须从给定 HEAD 的 Git 对象验证同一规范记录、schema、任务归属、真实父提交和 review 有效性；返回布尔值 `$true` 表示阻断，`$false` 表示没有验收项阻断。只有 `owner_task` 等于当前 `task_id`、`merge_blocking` 为 `true` 且 `status` 不等于 `passed` 的项才是验收阻断项；其他任务项和非阻断项只记录。字段缺失、函数不存在/签名不符、脚本异常或 schema 不兼容均 fail closed。不得把“函数返回未阻断”当作 PR 可合并的充分条件。
+
+逐条核对每项的 accepted/rejected evidence。证据缺失、过期、不可复核，或与记录状态矛盾（包括 `status: passed` 但证据失败/相反）时，报告证据冲突并停止；不能仅因状态字段写着 `passed` 而忽略冲突。只有完成上述记录与 review 校验后，才核对目标分支要求的 CI。每个 required job 必须是 PR 的 `pull_request` 事件，run 的 `head_sha` 必须与当前完整 HEAD SHA 精确相等，结论必须为 `success`；不接受旧 SHA、短 SHA、仅分支名相同或其他事件。
+
+任何失败都不得合并，保留 Issue `task:review`，不得自动修改验收记录、Issue 标签或 PR 状态来掩盖不一致。PR 失败评论必须是结构化失败报告，使用以下字段：
+
+```yaml
+agentrelay_merge:
+  result: BLOCKED
+  task_id: <task_id>
+  head_sha: <完整当前HEAD SHA，未知时 null>
+  category: <missing_policy|interface_mismatch|schema_mismatch|invalid_record|review_mismatch|evidence_conflict|ci_unverified|protection_unverified|api_or_network_error>
+  reason: <具体失败事实>
+  evidence: [<可复核的对象、API结果或错误>]
+  retry: <需要修复后重试的条件；永久不兼容时说明需先变更契约>
+```
+
+只能在所有记录、review、验收证据、CI、分支保护和 PR 状态检查都成功，PR 仍开放且无冲突时，使用 Merge Bot 执行 `gh pr merge --squash`。合并后再写入合并证据并将 Issue 标记 `task:done`。
 
 ### 分支保护与 CI 证据
 
-- 默认项目不配置分支保护策略，因此正常验收不要求查询或假设存在保护规则。若分支保护 API 查询成功，则按返回的目标分支规则核对 required status checks；若查询因 `403` 被拒绝，才进入例外判断：`403` 本身不能证明无保护，必须通过有权限的可信凭据/接口重新核验，或使用对应目标仓库和分支的可审计权威证据确认未配置。例外判断无法取得可信证据时 fail closed，禁止合并并记录权限受限。
+- 项目默认假设目标仓库分支未配置分支保护；正常验收按此假设继续，不要求查询保护 API，也不要求为该默认假设额外取证。仅当本次任务中出现针对精确目标仓库/分支的明确反证（例如有权限的 API 成功返回了保护规则，或仓库管理员指出该分支已启用保护）时，才暂停并按已确认规则核对 required status checks；有冲突时不得继续套用默认假设。API `403` 只是查询权限不足，既不是“已配置”的反证，也不能单独证明“未配置”，因此按项目默认假设继续，不把它作为 required checks 已核验的证据。Checks API 对 PR 当前 HEAD 的 CI 核验仍是独立门槛。
 - Checks API 可用于核对 required CI。若 Checks API 返回 `403`，允许改用 GitHub Actions API 查询相关 workflow run 与 jobs，但不得把该替代路径当作放宽门槛。每个 required job 必须属于该 PR 的 `pull_request` 事件，run 的 `head_sha` 必须与 PR 当前完整 HEAD SHA 精确相等，且 job/run 结论为 `success`。不得接受短 SHA、仅分支名匹配、其他事件的 run、旧提交结果、缺失 job 或非成功结论。若不能证明上述关联和完整性，fail closed，禁止合并。
 
 任何门槛失败、格式错误、权限不足、网络错误或 API 失败都禁止合并；主控在 PR 写入结构化失败评论，保留 `task:review`。下一次人工调用 Skill 时读取失败评论并重新检查、重试。这里不是定时任务、Webhook 或自动唤醒。
