@@ -31,6 +31,17 @@ description: Drive Superpowers planning and distribute approved coding tasks as 
 
 每个任务的执行结果通过关联 Pull Request 回传。
 
+## Issue 入口路由与契约澄清
+
+当 `agentrelay-task` 将 Issue URL 和证据交给 Orchestrator 时，先读取对应 Issue、已批准规格/计划、关联 PR 和最新 `agentrelay_review` finding。不要仅凭 finding 的类别标签作决定，必须核对 finding 是否能映射到已批准任务契约。
+
+- `code_defect`：若 finding 指向明确的范围内代码/配置错误，下一角色是 Worker；保留 PR，不要自行改写 Worker 的代码任务或尝试合并。
+- `evidence_gap`：若缺少 Issue 已要求的测试/证据且可在范围内补齐，下一角色是 Worker；证据满足前不得合并。
+- `contract_ambiguity`：比较 Issue、规格与计划。若验收意图可从已批准文档唯一确定，记录解释并交回 Worker 或 Reviewer 的对应下一步；若存在缺失或矛盾且无法无歧义解决，标记 `task:blocked`，说明冲突并向用户提出一个聚焦澄清问题。不得让 Worker 猜测。
+- `out_of_scope`：不得把该 finding 自动加入任务。向用户说明现有范围、额外要求及其来源；只有用户批准扩展后，才通过版本化计划/新 follow-up Issue 记录决定。保留原 Issue、已批准计划和已执行任务，不静默重写。
+
+每项 finding 的处理都要在 Issue/PR 上以稳定 finding ID 留痕：结论、契约依据、下一角色和后续证据。只有所有阻断 finding 都已闭合，且最新代码已由独立 Reviewer 审查，才进入自动验收与合并检查。`CHANGES_REQUESTED`、未分类 finding、无法映射的验收项、未决契约问题或证据冲突均阻止合并。修复任务应交给 Worker；契约澄清与范围决策属于 Orchestrator/用户，不由 Reviewer 或 Worker扩大范围。
+
 ## 自动验收与合并
 
 本技能的当前记录契约是 Acceptance v1：规范路径为 `acceptance/<task_id>.v1.json`，`schema_version` 必须为 `acceptance/v1`，逐项字段由 `docs/acceptance-schema-v1.json` 定义。历史记录、旧格式文件或旧评论只作迁移背景，不得当作 v1 记录，也不得推断为 v1 或臆造缺失字段、默认状态或版本。旧任务要参与自动验收时，必须有新增的 v1 记录逐项映射 Issue 原有验收标准；不得静默改写 Issue 或已批准计划。若目标仓库没有该 schema、没有兼容的规范记录，schema 不匹配或尚无明确支持的迁移格式，停止自动合并并报告不兼容；不得要求仓库先接受一个未定义的 schema 版本。
