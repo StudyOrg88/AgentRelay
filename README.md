@@ -1,11 +1,21 @@
 # AgentRelay
 
-AgentRelay 用 GitHub Issue、分支和 Pull Request 协调不同设备上的编码 Agent。
+AgentRelay 用 GitHub Issue、分支、Pull Request、review 和 Actions 协调不同设备上的编码 Agent。GitHub 是唯一事实来源；无需常驻服务或数据库。
 
-主控 Agent 使用 `skills/orchestrator/SKILL.md`：通过 Superpowers 形成规格和计划，再创建带依赖的任务 Issue。执行 Agent 使用 `skills/worker/SKILL.md`：人工选择任务，在 `task/<task_id>` 分支中执行 Superpowers、测试并创建 PR。
+## 默认入口
 
-复制 `AGENTS.md`、`.github/` 和 `skills/` 到目标仓库后即可采用协议。第一版没有常驻服务、数据库、云端执行器或自动并发领取。
+把目标 GitHub Issue 链接交给任意一个 Codex，并说：
 
-Reviewer 在另一台设备的新会话中人工调用 `agentrelay-reviewer`。完成后，在主控设备人工调用 `agentrelay-orchestrator`；主控会自动检查 Reviewer 的当前 SHA、required CI 和 Issue 验收证据，并在全部通过时使用 Merge Bot 执行 squash merge。失败时会在 PR 记录原因，下次再次调用主控 Skill 会自动重试。
+> 使用 `agentrelay-task` 处理这个任务：`<GitHub Issue URL>`
 
-Token 配置见 [`docs/credentials.md`](docs/credentials.md)。每个 Skill 根据自身角色自动读取对应的持久化环境变量。
+入口会从 GitHub 恢复任务状态，告诉你下一角色、依据和动作；如果当前会话可以安全承担该角色，就继续执行。若需要独立 Reviewer 会话、契约澄清或其他角色接手，会给出具体交接说明，你再决定在哪台设备启动 Codex，并把同一 Issue URL 交给它。
+
+- `worker`：开始或恢复实现；匹配已有分支/PR 时在原工作上继续。
+- `reviewer`：在与实现会话独立的新会话中按 Issue 验收契约审查。
+- `orchestrator`：澄清任务契约、核对验收与合并门槛，并在所有门槛通过时自动 squash merge。
+
+审查意见中的范围内代码缺陷或证据缺口交给 Worker；任务范围/验收契约含糊或超范围的要求交给 Orchestrator/用户判断，不让 Worker 猜测。自动合并仍要求 Acceptance v1、审查绑定当前代码 SHA、当前 HEAD 的 required CI 成功、PR 状态有效且无阻塞项；任何证据缺失或过期都会停止合并。
+
+复制 `AGENTS.md`、`.github/` 和 `skills/` 到目标仓库即可采用协议。三个 Codex 的设备由用户选择；AgentRelay 不选择设备、不按负载分配、不远程唤醒。网络不可用时本地提交仍可保留；GitHub Issue/PR 协作、Actions 和自动合并会在网络恢复后继续。
+
+Token 配置见 [`docs/credentials.md`](docs/credentials.md)。入口使用只读路由凭据，具体角色 Skill 自动读取各自的持久化环境变量。

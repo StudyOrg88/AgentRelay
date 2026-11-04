@@ -3,6 +3,7 @@
 每个角色使用固定的用户级环境变量；调用 Skill 时自动读取，不需要手动设置 `GH_TOKEN`。
 
 ```powershell
+[Environment]::SetEnvironmentVariable('AGENTRELAY_TOKEN_ROUTER', '<read-only-router-token>', 'User')
 [Environment]::SetEnvironmentVariable('AGENTRELAY_TOKEN_WORKER_1', '<worker-1-token>', 'User')
 [Environment]::SetEnvironmentVariable('AGENTRELAY_TOKEN_REVIEWER', '<reviewer-token>', 'User')
 [Environment]::SetEnvironmentVariable('AGENTRELAY_TOKEN_MERGE_BOT', '<merge-bot-token>', 'User')
