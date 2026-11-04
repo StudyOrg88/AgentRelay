@@ -46,14 +46,16 @@ Apply these rules in order:
 |---|---|---|
 | Issue is `task:planned`; required fields are valid, dependencies are complete, and no task branch/PR exists | `worker` | Start the approved task using the Worker Skill and `task/<task_id>` branch |
 | Issue is `task:in-progress` and a matching task branch or PR already exists | `worker` | Resume that exact work; do not create a duplicate branch or PR |
-| A matching PR is ready for independent review and no valid PASS covers the current code HEAD | `reviewer` | Review using the Reviewer Skill in a session that did not implement this task |
 | Current review has a concrete `code_defect` or in-scope `evidence_gap` | `worker` | Fix only the cited in-scope finding on the existing PR |
 | Review reports `contract_ambiguity` or `out_of_scope`, or its relationship to the approved contract is unclear | `orchestrator` | Clarify the task contract and record an explicit versioned change; do not ask Worker to guess |
+| A matching PR is ready for independent review, has no unresolved `CHANGES_REQUESTED` findings awaiting Worker/Orchestrator action, and no valid PASS covers the current code HEAD | `reviewer` | Review using the Reviewer Skill in a session that did not implement this task |
 | A valid PASS exists for the code being reviewed, but Acceptance v1, evidence, current-HEAD CI, PR state, or merge checks remain to be evaluated | `orchestrator` | Run the existing Orchestrator automatic acceptance and merge procedure |
 | All current-HEAD merge gates pass and the PR is open and mergeable | `orchestrator` | Continue the existing automatic squash merge and completion recording procedure |
 | Issue and PR are complete | `none` | Report completion without repeating work |
 
 A valid PASS must meet the existing Reviewer contract and current-HEAD SHA rules. A stale PASS, malformed review, or API response that cannot be tied to the current HEAD is not a PASS. When different sources disagree, do not pick the more permissive state; route to Orchestrator or block for reconciliation.
+
+Evaluate explicit unresolved findings before the generic missing-current-PASS rule. Historical `CHANGES_REQUESTED` comments are audit records; they route to Worker only while their findings remain unaddressed. Once Worker has responded to each finding with the repair/evidence and an independent Reviewer has issued a valid PASS for the current code HEAD, route to Orchestrator for merge checks rather than repeating review solely because an older `CHANGES_REQUESTED` comment remains in the timeline.
 
 ## Continue or hand off
 

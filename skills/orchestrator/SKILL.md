@@ -40,7 +40,7 @@ description: Drive Superpowers planning and distribute approved coding tasks as 
 - `contract_ambiguity`：比较 Issue、规格与计划。若验收意图可从已批准文档唯一确定，记录解释并交回 Worker 或 Reviewer 的对应下一步；若存在缺失或矛盾且无法无歧义解决，标记 `task:blocked`，说明冲突并向用户提出一个聚焦澄清问题。不得让 Worker 猜测。
 - `out_of_scope`：不得把该 finding 自动加入任务。向用户说明现有范围、额外要求及其来源；只有用户批准扩展后，才通过版本化计划/新 follow-up Issue 记录决定。保留原 Issue、已批准计划和已执行任务，不静默重写。
 
-每项 finding 的处理都要在 Issue/PR 上以稳定 finding ID 留痕：结论、契约依据、下一角色和后续证据。只有所有阻断 finding 都已闭合，且最新代码已由独立 Reviewer 审查，才进入自动验收与合并检查。`CHANGES_REQUESTED`、未分类 finding、无法映射的验收项、未决契约问题或证据冲突均阻止合并。修复任务应交给 Worker；契约澄清与范围决策属于 Orchestrator/用户，不由 Reviewer 或 Worker扩大范围。
+每项 finding 的处理都要在 Issue/PR 上以稳定 finding ID 留痕：结论、契约依据、下一角色和后续证据。只有所有阻断 finding 都已闭合，且最新代码已由独立 Reviewer 审查，才进入自动验收与合并检查。历史 `CHANGES_REQUESTED` 评论保留作审计，不会单独永久阻止合并；每项 finding 必须有 Worker 对该 ID 的修复/证据回应，并由独立 Reviewer 对当前完整 HEAD SHA 给出有效 PASS，才算闭合。未解决的 `CHANGES_REQUESTED`、未分类 finding、无法映射的验收项、未决契约问题或证据冲突均阻止合并。修复任务应交给 Worker；契约澄清与范围决策属于 Orchestrator/用户，不由 Reviewer 或 Worker扩大范围。
 
 ## 自动验收与合并
 
