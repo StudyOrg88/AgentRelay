@@ -204,8 +204,13 @@ public static class DeviceRegistry
     private static bool IsWindowsAbsolute(string path)
     {
         var normalized = path.Replace('/', '\\');
-        return Regex.IsMatch(normalized, @"\A[A-Za-z]:\\", RegexOptions.CultureInvariant) ||
-            normalized.StartsWith("\\\\", StringComparison.Ordinal);
+        if (Regex.IsMatch(normalized, @"\A[A-Za-z]:\\", RegexOptions.CultureInvariant))
+            return true;
+        if (!normalized.StartsWith("\\\\", StringComparison.Ordinal))
+            return false;
+
+        var components = normalized[2..].Split('\\');
+        return components.Length >= 2 && components[0].Length > 0 && components[1].Length > 0;
     }
 
     private static bool HasParentSegment(string path, string os)
