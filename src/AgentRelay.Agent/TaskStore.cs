@@ -90,6 +90,8 @@ public sealed class TaskStore
         {
             if (record.Request.TaskId != status.TaskId || record.Request.DeviceId != status.DeviceId)
                 throw new InvalidOperationException("Task status identity does not match the accepted request.");
+            if (!IsAllowedTransition(record.Status.Status, status.Status))
+                throw new InvalidOperationException("Task status cannot move backwards or change after reaching a terminal state.");
             return record with { Status = status };
         });
     }
@@ -103,6 +105,8 @@ public sealed class TaskStore
             if (record.Request.TaskId != report.TaskId || record.Request.IssueUrl != report.IssueUrl ||
                 record.Request.Role != report.Role || record.Request.DeviceId != report.DeviceId)
                 throw new InvalidOperationException("Task report identity does not match the accepted request.");
+            if (record.Status.Status != report.Status)
+                throw new InvalidOperationException("Task report status must match the current task status.");
             return record with { Report = report };
         });
     }
@@ -139,7 +143,7 @@ public sealed class TaskStore
             var report = TaskReport.Parse(record.Report.ToJson());
             if (report.TaskId != record.Request.TaskId || report.IdempotencyKey != record.Request.IdempotencyKey ||
                 report.IssueUrl != record.Request.IssueUrl || report.Role != record.Request.Role ||
-                report.DeviceId != record.Request.DeviceId)
+                report.DeviceId != record.Request.DeviceId || report.Status != record.Status.Status)
                 throw new JsonException("Stored task report identity is invalid.");
         }
         return record;
@@ -177,6 +181,27 @@ public sealed class TaskStore
     }
 
     private string RecordPath(string keyHash) => Path.Combine(_directory, $"{keyHash}.json");
+
+    private static bool IsAllowedTransition(AgentTaskStatus current, AgentTaskStatus next)
+    {
+        if (current == next)
+            return true;
+        if (IsTerminal(current))
+            return false;
+        return StateRank(next) >= StateRank(current);
+    }
+
+    private static int StateRank(AgentTaskStatus status) => status switch
+    {
+        AgentTaskStatus.Queued => 0,
+        AgentTaskStatus.Starting => 1,
+        AgentTaskStatus.Running => 2,
+        AgentTaskStatus.Succeeded or AgentTaskStatus.Failed or AgentTaskStatus.Cancelled or AgentTaskStatus.NeedsInput => 3,
+        _ => throw new ArgumentOutOfRangeException(nameof(status))
+    };
+
+    private static bool IsTerminal(AgentTaskStatus status) => status is
+        AgentTaskStatus.Succeeded or AgentTaskStatus.Failed or AgentTaskStatus.Cancelled or AgentTaskStatus.NeedsInput;
 
     private static string Hash(string value) => Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(value))).ToLowerInvariant();
 }
