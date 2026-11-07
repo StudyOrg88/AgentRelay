@@ -6,6 +6,24 @@ namespace AgentRelay.Core;
 public static class TaskContract
 {
     public const string SchemaVersion = "agentrelay-task/v1";
+
+    internal static bool IsCanonicalIssueUrl(string? value) =>
+        value is not null && System.Text.RegularExpressions.Regex.IsMatch(
+            value,
+            @"\Ahttps://github\.com/[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?/[A-Za-z0-9_.-]+/issues/[1-9][0-9]*\z",
+            System.Text.RegularExpressions.RegexOptions.CultureInvariant);
+
+    internal static void RequireProperties(string json, params string[] required)
+    {
+        using var document = JsonDocument.Parse(json);
+        if (document.RootElement.ValueKind != JsonValueKind.Object)
+            throw new JsonException("Task contract must be a JSON object.");
+        foreach (var property in required)
+        {
+            if (!document.RootElement.TryGetProperty(property, out _))
+                throw new JsonException($"Required task property '{property}' is missing.");
+        }
+    }
 }
 
 [JsonConverter(typeof(JsonStringEnumConverter<AgentRelayRole>))]
@@ -48,7 +66,7 @@ public sealed record TaskRequest(
 {
     public static TaskRequest Parse(string json)
     {
-        RequireProperties(json, "schema_version", "task_id", "idempotency_key", "issue_url", "role",
+        TaskContract.RequireProperties(json, "schema_version", "task_id", "idempotency_key", "issue_url", "role",
             "device_id", "repository", "workspace", "branch", "lifecycle_generation");
         var request = JsonSerializer.Deserialize<TaskRequest>(json, ContractJson.Options)
             ?? throw new JsonException("Task request cannot be null.");
@@ -72,10 +90,7 @@ public sealed record TaskRequest(
         Require(Repository, nameof(Repository));
         Require(Workspace, nameof(Workspace));
         Require(Branch, nameof(Branch));
-        if (!Uri.TryCreate(IssueUrl, UriKind.Absolute, out var uri) ||
-            uri.Scheme != Uri.UriSchemeHttps || uri.Host != "github.com" ||
-            !uri.IsDefaultPort || uri.Query.Length != 0 || uri.Fragment.Length != 0 ||
-            !System.Text.RegularExpressions.Regex.IsMatch(uri.AbsolutePath, @"^/[^/]+/[^/]+/issues/[1-9][0-9]*$"))
+        if (!TaskContract.IsCanonicalIssueUrl(IssueUrl))
             throw new JsonException("Issue URL must be a canonical GitHub Issue URL.");
         if (!Enum.IsDefined(Role))
             throw new JsonException("Unsupported task role.");
@@ -89,17 +104,6 @@ public sealed record TaskRequest(
             throw new JsonException($"Required task identity field '{field}' is missing.");
     }
 
-    private static void RequireProperties(string json, params string[] required)
-    {
-        using var document = JsonDocument.Parse(json);
-        if (document.RootElement.ValueKind != JsonValueKind.Object)
-            throw new JsonException("Task request must be a JSON object.");
-        foreach (var property in required)
-        {
-            if (!document.RootElement.TryGetProperty(property, out _))
-                throw new JsonException($"Required task property '{property}' is missing.");
-        }
-    }
 }
 
 public sealed record TaskStatusRecord(
@@ -112,11 +116,12 @@ public sealed record TaskStatusRecord(
 {
     public static TaskStatusRecord Parse(string json)
     {
+        TaskContract.RequireProperties(json, "schema_version", "task_id", "idempotency_key", "device_id", "status", "updated_at");
         var record = JsonSerializer.Deserialize<TaskStatusRecord>(json, ContractJson.Options)
             ?? throw new JsonException("Task status cannot be null.");
         if (record.SchemaVersion != TaskContract.SchemaVersion || string.IsNullOrWhiteSpace(record.TaskId) ||
             string.IsNullOrWhiteSpace(record.IdempotencyKey) || string.IsNullOrWhiteSpace(record.DeviceId) ||
-            !Enum.IsDefined(record.Status))
+            !Enum.IsDefined(record.Status) || record.UpdatedAt == default)
             throw new JsonException("Invalid or unsupported task status record.");
         return record;
     }
@@ -143,11 +148,14 @@ public sealed record TaskReport(
 {
     public static TaskReport Parse(string json)
     {
+        TaskContract.RequireProperties(json, "schema_version", "task_id", "idempotency_key", "issue_url", "role",
+            "device_id", "status", "started_at", "evidence", "findings", "blockers");
         var report = JsonSerializer.Deserialize<TaskReport>(json, ContractJson.Options)
             ?? throw new JsonException("Task report cannot be null.");
         if (report.SchemaVersion != TaskContract.SchemaVersion || string.IsNullOrWhiteSpace(report.TaskId) ||
             string.IsNullOrWhiteSpace(report.IdempotencyKey) || string.IsNullOrWhiteSpace(report.DeviceId) ||
-            !Enum.IsDefined(report.Role) || !Enum.IsDefined(report.Status) || report.Evidence is null ||
+            !TaskContract.IsCanonicalIssueUrl(report.IssueUrl) || !Enum.IsDefined(report.Role) ||
+            !Enum.IsDefined(report.Status) || report.StartedAt == default || report.Evidence is null ||
             report.Findings is null || report.Blockers is null)
             throw new JsonException("Invalid or unsupported task report.");
         return report;
