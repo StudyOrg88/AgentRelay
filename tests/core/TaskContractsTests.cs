@@ -48,6 +48,18 @@ public sealed class TaskContractsTests
         Assert.Throws<JsonException>(() => TaskRequest.Parse(ValidJson.Replace("\"task_id\":\"task-123\",", "\"task_id\":\"task-123\",\"secret\":\"must-not-be-accepted\",")));
     }
 
+    [Theory]
+    [InlineData("https://GITHUB.com/acme/project/issues/42")]
+    [InlineData("https://github.com/acme/pro%6Aect/issues/42")]
+    [InlineData("https://github.com/acme/project/issues/42/")]
+    [InlineData("https://github.com/acme/project/issues/042")]
+    [InlineData("")]
+    public void Request_rejects_noncanonical_issue_urls(string issueUrl)
+    {
+        Assert.ThrowsAny<JsonException>(() => TaskRequest.Parse(ValidJson.Replace(
+            "https://github.com/acme/project/issues/42", issueUrl)));
+    }
+
     [Fact]
     public void Status_values_are_exactly_the_v1_values()
     {
@@ -59,8 +71,26 @@ public sealed class TaskContractsTests
         foreach (var value in expected)
         {
             var json = $$"""{"schema_version":"agentrelay-task/v1","task_id":"t","idempotency_key":"k","device_id":"d","status":"{{value}}","updated_at":"1970-01-01T00:00:00+00:00"}""";
-            Assert.Equal(value, ToWireValue(TaskStatusRecord.Parse(json).Status));
+            var parsed = TaskStatusRecord.Parse(json);
+            using var serialized = JsonDocument.Parse(parsed.ToJson());
+            Assert.Equal(value, serialized.RootElement.GetProperty("status").GetString());
+            Assert.Equal(Enum.GetValues<TaskStatus>().Single(status =>
+                JsonDocument.Parse(new TaskStatusRecord(TaskContract.SchemaVersion, "task", "key", "device", status,
+                    DateTimeOffset.UnixEpoch).ToJson()).RootElement.GetProperty("status").GetString() == value), parsed.Status);
         }
+    }
+
+    [Fact]
+    public void Status_record_requires_every_wire_property()
+    {
+        var valid = """{"schema_version":"agentrelay-task/v1","task_id":"t","idempotency_key":"k","device_id":"d","status":"queued","updated_at":"1970-01-01T00:00:00+00:00"}""";
+        foreach (var property in new[] { "schema_version", "task_id", "idempotency_key", "device_id", "status", "updated_at" })
+        {
+            var missing = System.Text.RegularExpressions.Regex.Replace(valid, $",?\"{property}\":\"[^\"]*\",?", "");
+            Assert.ThrowsAny<JsonException>(() => TaskStatusRecord.Parse(missing));
+        }
+        var missingStatus = valid.Replace("\"status\":\"queued\",", "");
+        Assert.ThrowsAny<JsonException>(() => TaskStatusRecord.Parse(missingStatus));
     }
 
     [Fact]
@@ -79,6 +109,13 @@ public sealed class TaskContractsTests
         Assert.Equal(report.Blockers, parsed.Blockers);
         Assert.Throws<JsonException>(() => TaskReport.Parse(report.ToJson().Replace("\"task_id\":\"task-123\",", "")));
         Assert.Throws<JsonException>(() => TaskReport.Parse(report.ToJson().Replace("agentrelay-task/v1", "agentrelay-task/v2")));
+        Assert.ThrowsAny<JsonException>(() => TaskReport.Parse(report.ToJson().Replace(report.IssueUrl, "")));
+        Assert.ThrowsAny<JsonException>(() => TaskReport.Parse(report.ToJson().Replace(report.IssueUrl, "https://github.com/acme/project/issues/%34%32")));
+        foreach (var property in new[] { "schema_version", "task_id", "idempotency_key", "issue_url", "role", "device_id", "status", "started_at" })
+        {
+            var missing = System.Text.RegularExpressions.Regex.Replace(report.ToJson(), $",?\"{property}\":(?:\"[^\"]*\"|\"[^\"]*\"),?", "");
+            Assert.ThrowsAny<JsonException>(() => TaskReport.Parse(missing));
+        }
     }
 
     private static string ToWireValue(TaskStatus status) => status switch
