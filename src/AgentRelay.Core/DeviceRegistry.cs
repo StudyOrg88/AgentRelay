@@ -93,7 +93,7 @@ public static class DeviceRegistry
     {
         EnsureUniqueAndKnownProperties(entry, DeviceProperties, "Device entry");
         RequireProperties(entry, "id", "name", "os", "connection", "host", "port", "user", "repositories",
-            "roles", "enabled", "max_concurrency");
+            "roles", "enabled");
 
         var id = RequiredString(entry, "id");
         var name = RequiredString(entry, "name");
@@ -142,16 +142,19 @@ public static class DeviceRegistry
         if (enabledElement.ValueKind is not (JsonValueKind.True or JsonValueKind.False))
             throw new InvalidEntryException();
 
-        var concurrencyElement = entry.GetProperty("max_concurrency");
-        if (concurrencyElement.ValueKind != JsonValueKind.Object)
-            throw new InvalidEntryException();
-        EnsureUniqueAndKnownProperties(concurrencyElement, ValidRoles, "Concurrency map");
-        var concurrency = new Dictionary<string, int>(StringComparer.Ordinal);
-        foreach (var property in concurrencyElement.EnumerateObject())
+        var concurrency = roles.ToDictionary(role => role, _ => 1, StringComparer.Ordinal);
+        if (entry.TryGetProperty("max_concurrency", out var concurrencyElement))
         {
-            if (property.Value.ValueKind != JsonValueKind.Number || !property.Value.TryGetInt32(out var limit) || limit < 1)
+            if (concurrencyElement.ValueKind != JsonValueKind.Object)
                 throw new InvalidEntryException();
-            concurrency.Add(property.Name, limit);
+            EnsureUniqueAndKnownProperties(concurrencyElement, ValidRoles, "Concurrency map");
+            foreach (var property in concurrencyElement.EnumerateObject())
+            {
+                if (!concurrency.ContainsKey(property.Name) || property.Value.ValueKind != JsonValueKind.Number ||
+                    !property.Value.TryGetInt32(out var limit) || limit < 1)
+                    throw new InvalidEntryException();
+                concurrency[property.Name] = limit;
+            }
         }
 
         return new RegisteredDevice(id, name, os, connection, host, port, user,

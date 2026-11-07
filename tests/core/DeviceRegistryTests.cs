@@ -50,6 +50,40 @@ public sealed class DeviceRegistryTests
     }
 
     [Fact]
+    public void Load_defaults_every_declared_role_to_one_when_concurrency_map_is_omitted()
+    {
+        var entry = Entry().Replace(",\"max_concurrency\":{\"worker\":1,\"reviewer\":1}", "", StringComparison.Ordinal);
+        var result = LoadJson(Document(entry));
+
+        var device = Assert.Single(result.Devices);
+        Assert.Equal(1, device.MaxConcurrency["worker"]);
+        Assert.Equal(1, device.MaxConcurrency["reviewer"]);
+    }
+
+    [Fact]
+    public void Load_defaults_omitted_declared_role_to_one_when_concurrency_map_is_partial()
+    {
+        var entry = Entry().Replace("\"worker\":1,\"reviewer\":1", "\"worker\":3", StringComparison.Ordinal);
+        var result = LoadJson(Document(entry));
+
+        var device = Assert.Single(result.Devices);
+        Assert.Equal(3, device.MaxConcurrency["worker"]);
+        Assert.Equal(1, device.MaxConcurrency["reviewer"]);
+    }
+
+    [Fact]
+    public void Load_rejects_concurrency_for_a_role_the_device_does_not_declare()
+    {
+        var entry = Entry()
+            .Replace("\"worker\",\"reviewer\"", "\"worker\"", StringComparison.Ordinal)
+            .Replace("\"worker\":1,\"reviewer\":1", "\"reviewer\":1", StringComparison.Ordinal);
+        var result = LoadJson(Document(entry));
+
+        Assert.Empty(result.Devices);
+        Assert.NotEmpty(result.Diagnostics);
+    }
+
+    [Fact]
     public void Load_excludes_all_duplicate_ids_and_returns_sanitized_diagnostics()
     {
         const string secret = "ssh-private-secret-value";
