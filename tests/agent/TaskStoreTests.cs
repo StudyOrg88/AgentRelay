@@ -73,13 +73,14 @@ public sealed class TaskStoreTests
         using var directory = new TemporaryDirectory();
         var store = new TaskStore(directory.Path);
         var accepted = store.Submit(Request());
+        store.WriteStatus(Status(AgentTaskStatus.Succeeded));
 
         Assert.Throws<InvalidOperationException>(() => store.WriteStatus(new TaskStatusRecord(
             TaskContract.SchemaVersion, "other-task", "key-1", "device-a", AgentTaskStatus.Running, DateTimeOffset.UtcNow)));
         Assert.Throws<InvalidOperationException>(() => store.WriteStatus(new TaskStatusRecord(
             TaskContract.SchemaVersion, "task-1", "key-1", "other-device", AgentTaskStatus.Running, DateTimeOffset.UtcNow)));
         Assert.Throws<InvalidOperationException>(() => store.WriteReport(Report(issueUrl: "https://github.com/acme/project/issues/43")));
-        Assert.Equal(AgentTaskStatus.Queued, store.FindByTaskId(accepted.TaskId)!.Status.Status);
+        Assert.Equal(AgentTaskStatus.Succeeded, store.FindByTaskId(accepted.TaskId)!.Status.Status);
     }
 
     [Fact]
@@ -88,16 +89,54 @@ public sealed class TaskStoreTests
         using var directory = new TemporaryDirectory();
         var store = new TaskStore(directory.Path);
         store.Submit(Request());
-        var status = new TaskStatusRecord(TaskContract.SchemaVersion, "task-1", "key-1", "device-a",
-            AgentTaskStatus.Running, DateTimeOffset.UtcNow);
+        var status = Status(AgentTaskStatus.Succeeded);
 
         store.WriteStatus(status);
         store.WriteReport(Report());
 
         var persisted = store.FindByTaskId("task-1");
         Assert.NotNull(persisted);
-        Assert.Equal(AgentTaskStatus.Running, persisted.Status.Status);
+        Assert.Equal(AgentTaskStatus.Succeeded, persisted.Status.Status);
         Assert.Equal("https://github.com/acme/project/issues/42", persisted.Report!.IssueUrl);
+    }
+
+    [Fact]
+    public void WriteStatus_rejects_a_transition_back_to_an_earlier_state()
+    {
+        using var directory = new TemporaryDirectory();
+        var store = new TaskStore(directory.Path);
+        store.Submit(Request());
+        store.WriteStatus(Status(AgentTaskStatus.Running));
+
+        Assert.Throws<InvalidOperationException>(() => store.WriteStatus(Status(AgentTaskStatus.Starting)));
+        Assert.Equal(AgentTaskStatus.Running, store.FindByTaskId("task-1")!.Status.Status);
+    }
+
+    [Fact]
+    public void WriteStatus_rejects_changing_a_terminal_state()
+    {
+        using var directory = new TemporaryDirectory();
+        var store = new TaskStore(directory.Path);
+        store.Submit(Request());
+        store.WriteStatus(Status(AgentTaskStatus.Succeeded));
+
+        Assert.Throws<InvalidOperationException>(() => store.WriteStatus(Status(AgentTaskStatus.Running)));
+        Assert.Equal(AgentTaskStatus.Succeeded, store.FindByTaskId("task-1")!.Status.Status);
+    }
+
+    [Fact]
+    public void WriteReport_rejects_a_status_that_conflicts_with_the_current_task_state()
+    {
+        using var directory = new TemporaryDirectory();
+        var store = new TaskStore(directory.Path);
+        store.Submit(Request());
+        store.WriteStatus(Status(AgentTaskStatus.Running));
+
+        Assert.Throws<InvalidOperationException>(() => store.WriteReport(Report()));
+
+        var persisted = store.FindByTaskId("task-1");
+        Assert.Equal(AgentTaskStatus.Running, persisted!.Status.Status);
+        Assert.Null(persisted.Report);
     }
 
     [Fact]
@@ -138,6 +177,9 @@ public sealed class TaskStoreTests
     private static TaskReport Report(string issueUrl = "https://github.com/acme/project/issues/42") => new(
         TaskContract.SchemaVersion, "task-1", "key-1", issueUrl, AgentRelayRole.Worker, "device-a", AgentTaskStatus.Succeeded,
         DateTimeOffset.UnixEpoch, DateTimeOffset.UnixEpoch, "task/42", "abc123", ["tests passed"], [], [], null);
+
+    private static TaskStatusRecord Status(AgentTaskStatus status) => new(
+        TaskContract.SchemaVersion, "task-1", "key-1", "device-a", status, DateTimeOffset.UtcNow);
 
     private sealed class TemporaryDirectory : IDisposable
     {
