@@ -107,6 +107,8 @@ public sealed class TaskStore
                 throw new InvalidOperationException("Task report identity does not match the accepted request.");
             if (record.Status.Status != report.Status)
                 throw new InvalidOperationException("Task report status must match the current task status.");
+            if (!IsTerminal(record.Status.Status))
+                throw new InvalidOperationException("Task reports can only be written after the task reaches a terminal state.");
             return record with { Report = report };
         });
     }

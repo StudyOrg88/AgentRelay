@@ -140,6 +140,30 @@ public sealed class TaskStoreTests
     }
 
     [Fact]
+    public void WriteReport_rejects_nonterminal_report_without_preventing_terminal_completion()
+    {
+        using var directory = new TemporaryDirectory();
+        var store = new TaskStore(directory.Path);
+        store.Submit(Request());
+        store.WriteStatus(Status(AgentTaskStatus.Running));
+        var runningReport = Report() with { Status = AgentTaskStatus.Running };
+
+        Assert.Throws<InvalidOperationException>(() => store.WriteReport(runningReport));
+
+        store.WriteStatus(Status(AgentTaskStatus.Succeeded));
+        var completed = store.FindByTaskId("task-1");
+        Assert.NotNull(completed);
+        Assert.Equal(AgentTaskStatus.Succeeded, completed.Status.Status);
+        Assert.Null(completed.Report);
+
+        store.WriteReport(Report());
+
+        var reported = store.FindByTaskId("task-1");
+        Assert.Equal(AgentTaskStatus.Succeeded, reported!.Status.Status);
+        Assert.Equal(AgentTaskStatus.Succeeded, reported.Report!.Status);
+    }
+
+    [Fact]
     public void Store_fails_closed_on_corrupt_or_unsupported_record()
     {
         using var directory = new TemporaryDirectory();
