@@ -1,0 +1,31 @@
+{
+  "schema_version": "agentrelay-devices/v1",
+  "devices": [
+    {
+      "id": "fake-ubuntu-ssh",
+      "name": "Example Ubuntu SSH",
+      "os": "ubuntu",
+      "connection": "ssh",
+      "host": "example-ubuntu.invalid",
+      "port": 22,
+      "user": "example-user",
+      "repositories": ["/home/example/work/AgentRelay"],
+      "roles": ["worker", "reviewer"],
+      "enabled": false,
+      "max_concurrency": { "worker": 1, "reviewer": 1 }
+    },
+    {
+      "id": "fake-windows-ssh",
+      "name": "Example Windows SSH",
+      "os": "windows",
+      "connection": "ssh",
+      "host": "example-windows.invalid",
+      "port": 22,
+      "user": "example-user",
+      "repositories": ["C:/example/work/AgentRelay"],
+      "roles": ["worker"],
+      "enabled": false,
+      "max_concurrency": { "worker": 1 }
+    }
+  ]
+}
