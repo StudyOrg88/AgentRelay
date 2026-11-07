@@ -40,6 +40,27 @@ public sealed class DeviceRegistryTests
     }
 
     [Fact]
+    public void Load_accepts_windows_unc_repository_with_server_and_share()
+    {
+        var result = Load("windows", "ssh", "fake-windows-host", 22, "codex-user", [@"\\fake-server\fake-share\AgentRelay"]);
+
+        var device = Assert.Single(result.Devices);
+        Assert.Equal([@"\\fake-server\fake-share\AgentRelay"], device.Repositories);
+        Assert.Empty(result.Diagnostics);
+    }
+
+    [Theory]
+    [InlineData(@"\\")]
+    [InlineData(@"\\fake-server")]
+    public void Load_rejects_windows_unc_repository_without_server_or_share(string repository)
+    {
+        var result = Load("windows", "ssh", "fake-windows-host", 22, "codex-user", [repository]);
+
+        Assert.Empty(result.Devices);
+        Assert.NotEmpty(result.Diagnostics);
+    }
+
+    [Fact]
     public void Load_accepts_ubuntu_ssh_record()
     {
         var result = Load("ubuntu", "ssh", "fake-ubuntu-host", 22, "codex-user", ["/home/codex/work/AgentRelay"]);
@@ -152,10 +173,18 @@ public sealed class DeviceRegistryTests
     [Theory]
     [InlineData("relative/repo")]
     [InlineData("/home/codex/../secret")]
-    [InlineData("C:/repos/../secret")]
-    public void Load_rejects_relative_or_traversing_repository_paths(string repository)
+    public void Load_rejects_relative_or_traversing_ubuntu_repository_paths(string repository)
     {
         var result = Load("ubuntu", "ssh", "fake-host", 22, "codex", [repository]);
+
+        Assert.Empty(result.Devices);
+        Assert.NotEmpty(result.Diagnostics);
+    }
+
+    [Fact]
+    public void Load_rejects_windows_ssh_repository_with_parent_segment()
+    {
+        var result = Load("windows", "ssh", "fake-windows-host", 22, "codex-user", [@"C:\repos\..\secret"]);
 
         Assert.Empty(result.Devices);
         Assert.NotEmpty(result.Diagnostics);
