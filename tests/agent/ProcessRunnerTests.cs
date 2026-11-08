@@ -120,6 +120,28 @@ public sealed class ProcessRunnerTests
     }
 
     [Fact]
+    public async Task Unix_production_supervisor_tracks_codex_pid_and_task_bound_exit_marker()
+    {
+        if (OperatingSystem.IsWindows()) return;
+        using var temp = new TemporaryDirectory();
+        var fakeCodex = Path.Combine(temp.Path, "codex");
+        File.WriteAllText(fakeCodex, "#!/bin/sh\necho wrapper-test-output\nsleep 1\nexit 7\n");
+        using (var chmod = Process.Start(new ProcessStartInfo("chmod") { UseShellExecute = false, ArgumentList = { "+x", fakeCodex } })!) chmod.WaitForExit();
+        var store = new TaskStore(Path.Combine(temp.Path, "state"));
+        var request = Request("task-unix-production"); store.Submit(request);
+        var runner = new ProcessRunner(store, Path.Combine(temp.Path, "logs"), codexExecutable: fakeCodex);
+
+        var identity = runner.Start(request, temp.Path);
+        var persisted = store.FindByTaskId(request.TaskId)!.ProcessIdentity!;
+        Assert.Equal(identity, persisted);
+        Assert.True(new SystemProcessSupervisor().IsAlive(identity));
+        await WaitUntilAsync(() => File.Exists(Path.Combine(temp.Path, "logs", request.TaskId + ".exitcode")));
+        await WaitUntilAsync(() => !new SystemProcessSupervisor().IsAlive(identity));
+        Assert.Equal(AgentTaskStatus.Failed, runner.Reconcile(request.TaskId).Status);
+        Assert.Equal($"{identity.ProcessId}:7", File.ReadAllText(Path.Combine(temp.Path, "logs", request.TaskId + ".exitcode")));
+    }
+
+    [Fact]
     public void Fresh_agent_reconciles_exited_task_from_persisted_identity_and_exit_code()
     {
         using var temp = new TemporaryDirectory();
@@ -162,7 +184,7 @@ public sealed class ProcessRunnerTests
         public List<ProcessIdentity> Terminated { get; } = [];
         public bool IsAlive(ProcessIdentity identity) => Alive;
         public void Terminate(ProcessIdentity identity) => Terminated.Add(identity);
-        public int? ReadExitCode(ProcessIdentity identity, string exitCodePath) => File.Exists(exitCodePath) && int.TryParse(File.ReadAllText(exitCodePath), out var code) ? code : null;
+        public int? ReadExitCode(ProcessIdentity identity, string exitCodePath) => File.Exists(exitCodePath) && int.TryParse(File.ReadAllText(exitCodePath).Split(':').Last(), out var code) ? code : null;
     }
     private sealed class DeterministicLauncher(string directory) : IChildProcessLauncher
     {

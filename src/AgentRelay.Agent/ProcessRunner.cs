@@ -56,7 +56,13 @@ public sealed class SystemProcessSupervisor : IProcessSupervisor
 
     public int? ReadExitCode(ProcessIdentity identity, string exitCodePath)
     {
-        try { return File.Exists(exitCodePath) && int.TryParse(File.ReadAllText(exitCodePath), out var exitCode) ? exitCode : null; }
+        try
+        {
+            if (!File.Exists(exitCodePath)) return null;
+            var fields = File.ReadAllText(exitCodePath).Split(':');
+            return fields.Length == 2 && int.TryParse(fields[0], out var pid) &&
+                int.TryParse(fields[1], out var code) && pid == identity.ProcessId ? code : null;
+        }
         catch (IOException) { return null; }
     }
 }
@@ -69,6 +75,7 @@ public sealed class ProcessRunner
     private readonly IProcessSupervisor _supervisor;
     private readonly string _codexExecutable;
     private readonly IChildProcessLauncher _launcher;
+    public Action? AfterIdentityPersisted { get; set; }
 
     public ProcessRunner(TaskStore store, string logDirectory, IProcessSupervisor? supervisor = null,
         string codexExecutable = "codex", IChildProcessLauncher? launcher = null)
@@ -80,9 +87,16 @@ public sealed class ProcessRunner
         _launcher = launcher ?? new SystemChildProcessLauncher();
     }
 
-    public ProcessIdentity Start(TaskRequest request, string workingDirectory)
+    public ProcessIdentity Start(TaskRequest request, string workingDirectory, IChildProcessLauncher? launcher = null)
     {
         ValidateTaskId(request.TaskId);
+        var prior = _store.FindByTaskId(request.TaskId) ?? throw new InvalidOperationException("Task must be accepted before it can start.");
+        if (prior.ProcessIdentity is { } previous)
+        {
+            if (_supervisor.IsAlive(previous)) return previous;
+            if (File.Exists(ExitCodePath(request.TaskId)))
+                throw new InvalidOperationException("Task process already exited; reconcile it instead of launching it again.");
+        }
         Directory.CreateDirectory(_logDirectory);
         var logPath = LogPath(request.TaskId);
         var rolePrompt = request.Role == AgentRelayRole.Worker
@@ -93,8 +107,10 @@ public sealed class ProcessRunner
         using (File.Create(logPath)) { }
         try
         {
+            _store.WriteStatus(prior.Status with { Status = AgentTaskStatus.Starting, UpdatedAt = DateTimeOffset.UtcNow });
             Process process;
-            if (_launcher is SystemChildProcessLauncher)
+            var selectedLauncher = launcher ?? _launcher;
+            if (selectedLauncher is SystemChildProcessLauncher)
             {
                 process = StartDetachedSupervisor(request, workingDirectory, inputPath, logPath);
             }
@@ -102,7 +118,7 @@ public sealed class ProcessRunner
             {
                 var testStart = new ProcessStartInfo(_codexExecutable) { WorkingDirectory = workingDirectory, UseShellExecute = false };
                 testStart.ArgumentList.Add("exec"); testStart.ArgumentList.Add("--json"); testStart.ArgumentList.Add("-");
-                var child = _launcher.Start(testStart);
+                var child = selectedLauncher.Start(testStart);
                 process = child.Process;
                 var gate = new object();
                 process.OutputDataReceived += (_, e) => AppendSanitized(logPath, e.Data, gate);
@@ -113,12 +129,15 @@ public sealed class ProcessRunner
             }
             var identity = new ProcessIdentity(process.Id, process.StartTime.ToUniversalTime().Ticks);
             PersistIdentity(request.TaskId, identity);
+            AfterIdentityPersisted?.Invoke();
             _store.WriteStatus(new TaskStatusRecord(TaskContract.SchemaVersion, request.TaskId, request.IdempotencyKey,
                 request.DeviceId, AgentTaskStatus.Running, DateTimeOffset.UtcNow));
             return identity;
         }
         finally { try { File.Delete(inputPath); } catch (IOException) { } }
     }
+
+    public bool HasProcessIdentityFile(string taskId) => File.Exists(IdentityPath(taskId));
 
     public ProcessIdentity? GetVerifiedIdentity(string taskId)
     {
@@ -181,13 +200,15 @@ public sealed class ProcessRunner
         File.WriteAllText(temporary, JsonSerializer.Serialize(identity));
         File.Move(temporary, IdentityPath(taskId), overwrite: true);
         _store.WriteProcessIdentity(taskId, identity);
+        File.Delete(IdentityPath(taskId) + ".pid");
     }
 
     private async Task PersistTestChildExitAsync(Process process, string taskId)
     {
         await process.WaitForExitAsync().ConfigureAwait(false);
         process.WaitForExit();
-        File.WriteAllText(ExitCodePath(taskId), process.ExitCode.ToString(System.Globalization.CultureInfo.InvariantCulture));
+        var identity = new ProcessIdentity(process.Id, process.StartTime.ToUniversalTime().Ticks);
+        File.WriteAllText(ExitCodePath(taskId), $"{identity.ProcessId}:{process.ExitCode}");
         process.Dispose();
     }
 
@@ -198,7 +219,7 @@ public sealed class ProcessRunner
         if (OperatingSystem.IsWindows())
         {
             var childIdentityPath = IdentityPath(request.TaskId) + ".child";
-            File.WriteAllText(scriptPath, "$ErrorActionPreference='Stop'; try { $p=Start-Process -FilePath $env:AGENTRELAY_CODEX -ArgumentList @('exec','--json','-') -WorkingDirectory $env:AGENTRELAY_WORKDIR -RedirectStandardInput $env:AGENTRELAY_INPUT -RedirectStandardOutput $env:AGENTRELAY_OUT -RedirectStandardError $env:AGENTRELAY_ERR -PassThru; $p.StartTime.ToUniversalTime().Ticks.ToString() + ':' + $p.Id.ToString() | Set-Content -NoNewline $env:AGENTRELAY_IDENTITY; $p.WaitForExit(); $p.Refresh(); foreach($line in (Get-Content $env:AGENTRELAY_OUT) + (Get-Content $env:AGENTRELAY_ERR)) { $line -replace '(?i)(token|password|secret|authorization)(\\s*[:=]\\s*)[^\\s,;]+', '$1$2[redacted]' | Add-Content $env:AGENTRELAY_LOG }; $tmp=$env:AGENTRELAY_EXIT+'.tmp'; [System.IO.File]::WriteAllText($tmp, [string]$p.ExitCode); Move-Item -Force $tmp $env:AGENTRELAY_EXIT; Remove-Item -Force $env:AGENTRELAY_INPUT } catch { $_.ToString() | Set-Content -NoNewline ($env:AGENTRELAY_IDENTITY+'.error'); exit 1 }");
+            File.WriteAllText(scriptPath, "$ErrorActionPreference='Stop'; try { $p=Start-Process -FilePath $env:AGENTRELAY_CODEX -ArgumentList @('exec','--json','-') -WorkingDirectory $env:AGENTRELAY_WORKDIR -RedirectStandardInput $env:AGENTRELAY_INPUT -RedirectStandardOutput $env:AGENTRELAY_OUT -RedirectStandardError $env:AGENTRELAY_ERR -PassThru; $ticks=$p.StartTime.ToUniversalTime().Ticks; \"$ticks`:$($p.Id)\" | Set-Content -NoNewline $env:AGENTRELAY_IDENTITY; $p.WaitForExit(); $p.Refresh(); foreach($line in (Get-Content $env:AGENTRELAY_OUT) + (Get-Content $env:AGENTRELAY_ERR)) { $line -replace '(?i)(token|password|secret|authorization)(\\s*[:=]\\s*)[^\\s,;]+', '$1$2[redacted]' | Add-Content $env:AGENTRELAY_LOG }; $tmp=$env:AGENTRELAY_EXIT+'.tmp'; [System.IO.File]::WriteAllText($tmp, \"$($p.Id):$($p.ExitCode)\"); Move-Item -Force $tmp $env:AGENTRELAY_EXIT; Remove-Item -Force $env:AGENTRELAY_INPUT } catch { $_.ToString() | Set-Content -NoNewline ($env:AGENTRELAY_IDENTITY+'.error'); exit 1 }");
             var start = new ProcessStartInfo("powershell.exe") { UseShellExecute = false, CreateNoWindow = true, RedirectStandardError = true, RedirectStandardOutput = true, WorkingDirectory = workingDirectory };
             start.ArgumentList.Add("-NoProfile"); start.ArgumentList.Add("-NonInteractive"); start.ArgumentList.Add("-ExecutionPolicy"); start.ArgumentList.Add("Bypass"); start.ArgumentList.Add("-File"); start.ArgumentList.Add(scriptPath);
             start.Environment["AGENTRELAY_CODEX"] = codexExecutable;
@@ -226,7 +247,7 @@ public sealed class ProcessRunner
         }
 
         var pidFile = IdentityPath(request.TaskId) + ".pid";
-        File.WriteAllText(scriptPath, "#!/bin/bash\ninput=$1; log=$2; exitfile=$3; codex=$4; pidfile=$5\n\"$codex\" exec --json - < \"$input\" > >(sed -E 's/(token|password|secret|authorization)([[:space:]]*[:=][[:space:]]*)[^[:space:],;]+/\\1\\2[redacted]/Ig' >> \"$log\") 2> >(sed -E 's/(token|password|secret|authorization)([[:space:]]*[:=][[:space:]]*)[^[:space:],;]+/\\1\\2[redacted]/Ig' >> \"$log\") &\nchild=$!\nprintf '%s' \"$child\" > \"$pidfile\"\nwait \"$child\"; code=$?\nprintf '%s' \"$code\" > \"$exitfile.tmp\"\nmv -f \"$exitfile.tmp\" \"$exitfile\"\nexit \"$code\"\n");
+        File.WriteAllText(scriptPath, "#!/bin/bash\ninput=$1; log=$2; exitfile=$3; codex=$4; pidfile=$5\n\"$codex\" exec --json - < \"$input\" > >(sed -E 's/(token|password|secret|authorization)([[:space:]]*[:=][[:space:]]*)[^[:space:],;]+/\\1\\2[redacted]/Ig' >> \"$log\") 2> >(sed -E 's/(token|password|secret|authorization)([[:space:]]*[:=][[:space:]]*)[^[:space:],;]+/\\1\\2[redacted]/Ig' >> \"$log\") &\nchild=$!\nprintf '%s' \"$child\" > \"$pidfile.tmp\"\nmv -f \"$pidfile.tmp\" \"$pidfile\"\nwait \"$child\"; code=$?\nprintf '%s:%s' \"$child\" \"$code\" > \"$exitfile.tmp\"\nmv -f \"$exitfile.tmp\" \"$exitfile\"\nexit \"$code\"\n");
         var chmod = new ProcessStartInfo("chmod") { UseShellExecute = false };
         chmod.ArgumentList.Add("+x"); chmod.ArgumentList.Add(scriptPath);
         using (var permission = Process.Start(chmod) ?? throw new InvalidOperationException("Unable to prepare task supervisor.")) permission.WaitForExit();
@@ -237,7 +258,11 @@ public sealed class ProcessRunner
         while (!File.Exists(pidFile) && DateTime.UtcNow < deadline) Thread.Sleep(10);
         if (!File.Exists(pidFile) || !int.TryParse(File.ReadAllText(pidFile), out var childPid))
             throw new InvalidOperationException("Detached task did not persist its child process identity.");
-        try { return Process.GetProcessById(childPid); }
+        try
+        {
+            var child = Process.GetProcessById(childPid);
+            return child;
+        }
         catch (ArgumentException) when (File.Exists(ExitCodePath(request.TaskId)))
         { throw new InvalidOperationException("Task exited before its process identity could be observed."); }
     }

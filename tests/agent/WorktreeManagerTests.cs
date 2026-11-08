@@ -94,6 +94,19 @@ public sealed class WorktreeManagerTests
         Assert.True(Directory.Exists(request.Workspace));
     }
 
+    [Fact]
+    public async Task Workspace_root_replacement_before_git_add_is_detected()
+    {
+        using var temp = new TemporaryDirectory();
+        var repo = temp.CreateGitRepository("repo");
+        var root = Path.Combine(repo, ".agentrelay-worktrees");
+        var outside = Path.Combine(temp.Path, "outside"); Directory.CreateDirectory(outside);
+        var manager = new WorktreeManager([repo]);
+        manager.BeforeWorktreeAdd = _ => Directory.CreateSymbolicLink(Request(repo).Workspace, outside);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => manager.CreateAsync(Request(repo)));
+    }
+
     private static TaskRequest Request(string repo) => new(TaskContract.SchemaVersion, "task-one", "key-one",
         "https://github.com/acme/repo/issues/1", AgentRelayRole.Worker, "device-a", repo,
         Path.Combine(repo, ".agentrelay-worktrees", "task-one"), "task/one", 1);

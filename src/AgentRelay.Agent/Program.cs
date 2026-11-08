@@ -10,13 +10,16 @@ public sealed class AgentService
     private readonly TaskStore _store;
     private readonly WorktreeManager _worktrees;
     private readonly ProcessRunner _runner;
+    private readonly IChildProcessLauncher? _launcher;
 
-    public AgentService(RegisteredDevice device, TaskStore store, WorktreeManager worktrees, ProcessRunner runner)
+    public AgentService(RegisteredDevice device, TaskStore store, WorktreeManager worktrees, ProcessRunner runner,
+        IChildProcessLauncher? launcher = null)
     {
         _device = device;
         _store = store;
         _worktrees = worktrees;
         _runner = runner;
+        _launcher = launcher;
     }
 
     public async Task<string> ExecuteAsync(string operation, string json, CancellationToken cancellationToken = default)
@@ -43,18 +46,22 @@ public sealed class AgentService
     {
         var request = TaskRequest.Parse(json.GetRawText());
         using var submissionLease = _store.AcquireSubmissionLease(request.IdempotencyKey);
-        if (!_device.Enabled || request.DeviceId != _device.Id || !_device.Roles.Contains(request.Role.ToString().ToLowerInvariant()) ||
-            !_device.Repositories.Any(path => SamePath(path, request.Repository)))
+        if (!_device.Enabled || request.DeviceId != _device.Id || !_device.Roles.Contains(request.Role.ToString().ToLowerInvariant()))
             throw new InvalidOperationException("Task identity, role, or repository is not approved.");
-        var workspace = _worktrees.ValidateWorkspace(request);
         var existing = _store.FindByIdempotencyKey(request.IdempotencyKey);
         if (existing is not null)
         {
             var repeated = _store.Submit(request);
             if (repeated.Disposition == TaskSubmissionDisposition.Conflict) throw new InvalidOperationException("Idempotency key conflict.");
-            _ = _runner.Reconcile(repeated.TaskId);
-            return _store.FindByTaskId(repeated.TaskId)!.Status;
+            var existingRecord = _store.FindByTaskId(repeated.TaskId)!;
+            if (!_device.Repositories.Any(path => SamePath(path, existingRecord.Request.Repository)))
+                throw new InvalidOperationException("Accepted task repository is no longer approved.");
+            return await ResumeOrReturnAsync(existingRecord, cancellationToken).ConfigureAwait(false);
         }
+
+        if (!_device.Repositories.Any(path => SamePath(path, request.Repository)))
+            throw new InvalidOperationException("Task identity, role, or repository is not approved.");
+        var workspace = _worktrees.ValidateWorkspace(request);
 
         var accepted = _store.Submit(request);
         if (accepted.Disposition == TaskSubmissionDisposition.Conflict) throw new InvalidOperationException("Idempotency key conflict.");
@@ -63,25 +70,40 @@ public sealed class AgentService
             _ = _runner.Reconcile(accepted.TaskId);
             return _store.FindByTaskId(accepted.TaskId)!.Status;
         }
-        try
+        await ResumeOrStartAsync(request, workspace, cancellationToken).ConfigureAwait(false);
+        return _store.FindByTaskId(request.TaskId)!.Status;
+    }
+
+    private async Task<TaskStatusRecord> ResumeOrReturnAsync(StoredTaskRecord record, CancellationToken cancellationToken)
+    {
+        if (record.Status.Status is AgentTaskStatus.Queued or AgentTaskStatus.Starting)
+            return await ResumeOrStartAsync(record.Request, _worktrees.ValidateWorkspace(record.Request), cancellationToken).ConfigureAwait(false);
+        return _runner.Reconcile(record.Request.TaskId);
+    }
+
+    private async Task<TaskStatusRecord> ResumeOrStartAsync(TaskRequest request, string workspace, CancellationToken cancellationToken)
+    {
+        var record = _store.FindByTaskId(request.TaskId)!;
+        if (record.ProcessIdentity is not null)
         {
-            var actualWorkspace = await _worktrees.CreateAsync(request, cancellationToken).ConfigureAwait(false);
-            if (!SamePath(workspace, actualWorkspace)) throw new InvalidOperationException("Created worktree path did not match the task identity.");
-            _runner.Start(request, actualWorkspace);
-        }
-        catch
-        {
-            var record = _store.FindByTaskId(request.TaskId)!;
-            if (record.Status.Status == AgentTaskStatus.Queued)
+            if (_runner.GetVerifiedIdentity(request.TaskId) is not null)
             {
-                _store.WriteStatus(record.Status with { Status = AgentTaskStatus.Failed, UpdatedAt = DateTimeOffset.UtcNow });
-                _store.WriteReport(new TaskReport(TaskContract.SchemaVersion, request.TaskId, request.IdempotencyKey,
-                    request.IssueUrl, request.Role, request.DeviceId, AgentTaskStatus.Failed, DateTimeOffset.UtcNow,
-                    DateTimeOffset.UtcNow, request.Branch, null, [], [], ["Task process failed to start."], null));
+                _store.WriteStatus(record.Status with { Status = AgentTaskStatus.Running, UpdatedAt = DateTimeOffset.UtcNow });
+                return _store.FindByTaskId(request.TaskId)!.Status;
             }
-            throw;
+            var reconciled = _runner.Reconcile(request.TaskId);
+            if (reconciled.Status != AgentTaskStatus.Queued && reconciled.Status != AgentTaskStatus.Starting)
+                return reconciled;
+            if (_runner.HasProcessIdentityFile(request.TaskId))
+                throw new InvalidOperationException("Task has a persisted process identity but no verifiable live process or exit marker; refusing duplicate launch.");
         }
-        return accepted;
+
+        if (record.Status.Status == AgentTaskStatus.Queued)
+            _store.WriteStatus(record.Status with { Status = AgentTaskStatus.Starting, UpdatedAt = DateTimeOffset.UtcNow });
+        var actualWorkspace = await _worktrees.CreateOrValidateAsync(request, cancellationToken).ConfigureAwait(false);
+        if (!SamePath(workspace, actualWorkspace)) throw new InvalidOperationException("Created worktree path did not match the task identity.");
+        _runner.Start(request, actualWorkspace, _launcher);
+        return _store.FindByTaskId(request.TaskId)!.Status;
     }
 
     private object Status(string taskId)

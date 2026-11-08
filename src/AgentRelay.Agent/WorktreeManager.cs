@@ -8,6 +8,7 @@ public sealed class WorktreeManager
 {
     private static readonly Regex SafeTaskId = new(@"\A[A-Za-z0-9][A-Za-z0-9._-]*\z", RegexOptions.CultureInvariant);
     private readonly IReadOnlyList<string> _repositories;
+    public Action<string>? BeforeWorktreeAdd { get; set; }
 
     public WorktreeManager(IEnumerable<string> approvedRepositories)
     {
@@ -49,16 +50,25 @@ public sealed class WorktreeManager
     {
         var repository = ValidateRepository(request.Repository);
         var workspaceRoot = Path.Combine(repository, ".agentrelay-worktrees");
+        if (Directory.Exists(workspaceRoot) && (File.GetAttributes(workspaceRoot) & FileAttributes.ReparsePoint) != 0)
+            throw new InvalidOperationException("Worktree root cannot be a symbolic link or junction.");
         Directory.CreateDirectory(workspaceRoot);
         var lockDirectory = Path.Combine(workspaceRoot, ".locks");
         Directory.CreateDirectory(lockDirectory);
-        var lockPath = Path.Combine(lockDirectory, Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(request.TaskId))) + ".lock");
-        using var lease = AcquireWorkspaceLock(lockPath, request.TaskId);
+        if ((File.GetAttributes(workspaceRoot) & FileAttributes.ReparsePoint) != 0 ||
+            (File.GetAttributes(lockDirectory) & FileAttributes.ReparsePoint) != 0)
+            throw new InvalidOperationException("Worktree root or lock directory cannot be a symbolic link or junction.");
+        var lockPath = Path.Combine(lockDirectory, "root.lock");
+        using var lease = AcquireWorkspaceLock(lockPath, "worktree root");
         repository = ValidateRepository(request.Repository);
+        ValidateWorkspaceRoot(workspaceRoot);
         var workspace = ValidateWorkspace(request);
         Directory.CreateDirectory(Path.GetDirectoryName(workspace)!);
         if (Directory.Exists(workspace) || File.Exists(workspace)) throw new InvalidOperationException("Task workspace already exists.");
         if (BranchExists(repository, request.Branch)) throw new InvalidOperationException("Task branch already exists.");
+        BeforeWorktreeAdd?.Invoke(workspaceRoot);
+        ValidateWorkspaceRoot(workspaceRoot);
+        if (Directory.Exists(workspace) || File.Exists(workspace)) throw new InvalidOperationException("Task workspace was created concurrently.");
         var start = new ProcessStartInfo("git")
         {
             WorkingDirectory = repository,
@@ -81,7 +91,35 @@ public sealed class WorktreeManager
             throw new InvalidOperationException("git worktree add failed: " + Sanitize(detail));
         }
         _ = await stdout.ConfigureAwait(false);
+        var resolvedWorkspace = ResolveExistingPath(workspace);
+        if (!SamePath(resolvedWorkspace, workspace))
+            throw new InvalidOperationException("Created worktree resolves outside its task-specific workspace path.");
+        ValidateRepository(repository);
         return workspace;
+    }
+
+    public Task<string> CreateOrValidateAsync(TaskRequest request, CancellationToken cancellationToken = default)
+    {
+        var repository = ValidateRepository(request.Repository);
+        var workspace = ValidateWorkspace(request);
+        if (Directory.Exists(workspace))
+        {
+            var resolved = ResolveExistingPath(workspace);
+            if (!SamePath(resolved, workspace) || !File.Exists(Path.Combine(workspace, ".git")))
+                throw new InvalidOperationException("Existing task workspace is not the registered Git worktree.");
+            return Task.FromResult(workspace);
+        }
+        return CreateAsync(request, cancellationToken);
+    }
+
+    private static void ValidateWorkspaceRoot(string root)
+    {
+        if (!Directory.Exists(root)) throw new DirectoryNotFoundException("Worktree root is missing.");
+        var locks = Path.Combine(root, ".locks");
+        if (!Directory.Exists(locks)) throw new DirectoryNotFoundException("Worktree lock directory is missing.");
+        foreach (var path in new[] { root, locks })
+            if ((File.GetAttributes(path) & FileAttributes.ReparsePoint) != 0)
+                throw new InvalidOperationException("Worktree root or lock directory cannot be a symbolic link or junction.");
     }
 
     private static string ResolveExistingPath(string path)

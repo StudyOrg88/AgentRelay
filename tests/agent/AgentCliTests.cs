@@ -96,9 +96,62 @@ public sealed class AgentCliTests
         var results = await Task.WhenAll(Enumerable.Range(0, 16).Select(_ => service.ExecuteAsync("submit", request.ToJson())));
 
         Assert.Equal(1, launcher.StartCount);
-        Assert.Equal(1, results.Count(result => JsonDocument.Parse(result).RootElement.TryGetProperty("Disposition", out _)));
         Assert.Equal(16, results.Length);
+        Assert.All(results, result => Assert.True(new[] { "running", "failed" }.Contains(JsonDocument.Parse(result).RootElement.GetProperty("status").GetString())));
         Assert.NotNull(store.FindByTaskId(request.TaskId));
+    }
+
+    [Fact]
+    public async Task Failed_launch_leaves_retryable_starting_task_and_retry_starts_once()
+    {
+        using var temp = new TemporaryDirectory();
+        var repo = temp.CreateGitRepository();
+        var request = Request(repo);
+        var device = new RegisteredDevice("device-a", "Local", OperatingSystem.IsWindows() ? "windows" : "ubuntu", "local", null, null, null,
+            [repo], ["worker"], true, new Dictionary<string, int> { ["worker"] = 1 });
+        var store = new TaskStore(Path.Combine(temp.Path, "state"));
+        var launcher = new CountingLauncher();
+        var runner = new ProcessRunner(store, Path.Combine(temp.Path, "logs"), launcher: launcher);
+        var failOnce = true;
+        runner.AfterIdentityPersisted = () =>
+        {
+            if (!failOnce) return;
+            failOnce = false;
+            throw new InvalidOperationException("injected failure after durable process identity");
+        };
+        var service = new AgentService(device, store, new WorktreeManager([repo]), runner);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => service.ExecuteAsync("submit", request.ToJson()));
+        Assert.Equal(AgentTaskStatus.Starting, store.FindByTaskId(request.TaskId)!.Status.Status);
+        Assert.NotNull(store.FindByTaskId(request.TaskId)!.ProcessIdentity);
+
+        using var response = JsonDocument.Parse(await service.ExecuteAsync("submit", request.ToJson()));
+        Assert.Equal("running", response.RootElement.GetProperty("status").GetString());
+        Assert.Equal(1, launcher.StartCount);
+    }
+
+    [Fact]
+    public async Task Existing_idempotency_key_returns_original_task_if_request_workspace_was_removed()
+    {
+        using var temp = new TemporaryDirectory();
+        var repo = temp.CreateGitRepository();
+        var request = Request(repo);
+        var device = new RegisteredDevice("device-a", "Local", OperatingSystem.IsWindows() ? "windows" : "ubuntu", "local", null, null, null,
+            [repo], ["worker"], true, new Dictionary<string, int> { ["worker"] = 1 });
+        var store = new TaskStore(Path.Combine(temp.Path, "state"));
+        store.Submit(request);
+        store.WriteStatus(new TaskStatusRecord(TaskContract.SchemaVersion, request.TaskId, request.IdempotencyKey,
+            request.DeviceId, AgentTaskStatus.Failed, DateTimeOffset.UtcNow));
+        store.WriteReport(new TaskReport(TaskContract.SchemaVersion, request.TaskId, request.IdempotencyKey,
+            request.IssueUrl, request.Role, request.DeviceId, AgentTaskStatus.Failed, DateTimeOffset.UtcNow,
+            DateTimeOffset.UtcNow, request.Branch, null, [], [], ["original"], null));
+        var service = new AgentService(device, store, new WorktreeManager([repo]),
+            new ProcessRunner(store, Path.Combine(temp.Path, "logs"), new NeverAliveSupervisor()));
+
+        using var response = JsonDocument.Parse(await service.ExecuteAsync("submit", request.ToJson()));
+
+        Assert.Equal("failed", response.RootElement.GetProperty("status").GetString());
+        Assert.Equal(AgentTaskStatus.Failed, store.FindByTaskId(request.TaskId)!.Status.Status);
     }
 
     [Fact]
@@ -161,7 +214,7 @@ public sealed class AgentCliTests
         public bool Alive { get; set; } = true;
         public bool IsAlive(ProcessIdentity identity) => Alive;
         public void Terminate(ProcessIdentity identity) { }
-        public int? ReadExitCode(ProcessIdentity identity, string path) => File.Exists(path) && int.TryParse(File.ReadAllText(path), out var code) ? code : null;
+        public int? ReadExitCode(ProcessIdentity identity, string path) => File.Exists(path) && int.TryParse(File.ReadAllText(path).Split(':').Last(), out var code) ? code : null;
     }
     private sealed class TemporaryDirectory : IDisposable
     {
