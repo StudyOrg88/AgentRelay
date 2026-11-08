@@ -1,4 +1,6 @@
 using System.Text.Json;
+using System.Security.Cryptography;
+using System.Text;
 using AgentRelay.Agent;
 using AgentRelay.Core;
 using AgentTaskStatus = AgentRelay.Core.TaskStatus;
@@ -36,6 +38,35 @@ public sealed class TaskStoreTests
         Assert.Single(results.Select(result => result.TaskId).Distinct());
         Assert.Single(results, result => result.Disposition == TaskSubmissionDisposition.Accepted);
         Assert.Single(Directory.GetFiles(directory.Path, "*.json"));
+    }
+
+    [Fact]
+    public void Submit_reports_contextual_timeout_when_idempotency_lock_is_held()
+    {
+        using var directory = new TemporaryDirectory();
+        var request = Request();
+        var keyHash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(request.IdempotencyKey))).ToLowerInvariant();
+        var lockPath = Path.Combine(directory.Path, keyHash + ".lock");
+        using var heldLock = new FileStream(lockPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
+        var store = new TaskStore(directory.Path, lockTimeout: TimeSpan.FromMilliseconds(80));
+
+        var error = Assert.Throws<TimeoutException>(() => store.Submit(request));
+
+        Assert.Contains("lock", error.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains(keyHash[..12], error.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Submission_lease_is_exclusive_per_idempotency_key()
+    {
+        using var directory = new TemporaryDirectory();
+        var first = new TaskStore(directory.Path, lockTimeout: TimeSpan.FromMilliseconds(50));
+        var second = new TaskStore(directory.Path, lockTimeout: TimeSpan.FromMilliseconds(50));
+        using var lease = first.AcquireSubmissionLease("same-key");
+
+        var error = Assert.Throws<TimeoutException>(() => second.AcquireSubmissionLease("same-key"));
+
+        Assert.Contains("task submission", error.Message, StringComparison.Ordinal);
     }
 
     [Fact]

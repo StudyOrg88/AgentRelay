@@ -81,6 +81,27 @@ public sealed class AgentCliTests
     }
 
     [Fact]
+    public async Task Concurrent_same_key_submissions_create_and_start_exactly_one_task()
+    {
+        using var temp = new TemporaryDirectory();
+        var repo = temp.CreateGitRepository();
+        var request = Request(repo);
+        var device = new RegisteredDevice("device-a", "Local", OperatingSystem.IsWindows() ? "windows" : "ubuntu", "local", null, null, null,
+            [repo], ["worker"], true, new Dictionary<string, int> { ["worker"] = 1 });
+        var store = new TaskStore(Path.Combine(temp.Path, "state"));
+        var launcher = new CountingLauncher();
+        var runner = new ProcessRunner(store, Path.Combine(temp.Path, "logs"), launcher: launcher);
+        var service = new AgentService(device, store, new WorktreeManager([repo]), runner);
+
+        var results = await Task.WhenAll(Enumerable.Range(0, 16).Select(_ => service.ExecuteAsync("submit", request.ToJson())));
+
+        Assert.Equal(1, launcher.StartCount);
+        Assert.Equal(1, results.Count(result => JsonDocument.Parse(result).RootElement.TryGetProperty("Disposition", out _)));
+        Assert.Equal(16, results.Length);
+        Assert.NotNull(store.FindByTaskId(request.TaskId));
+    }
+
+    [Fact]
     public async Task Status_report_and_cancel_reconcile_by_task_id_and_preserve_workspace()
     {
         using var temp = new TemporaryDirectory();
@@ -120,6 +141,20 @@ public sealed class AgentCliTests
         public bool IsAlive(ProcessIdentity identity) => false;
         public void Terminate(ProcessIdentity identity) => throw new InvalidOperationException();
         public int? ReadExitCode(ProcessIdentity identity, string exitCodePath) => null;
+    }
+    private sealed class CountingLauncher : IChildProcessLauncher
+    {
+        public int StartCount { get; private set; }
+        public ChildProcess Start(System.Diagnostics.ProcessStartInfo ignored)
+        {
+            StartCount++;
+            var start = new System.Diagnostics.ProcessStartInfo(OperatingSystem.IsWindows() ? (Environment.GetEnvironmentVariable("ComSpec") ?? "cmd.exe") : "/bin/sh")
+            { UseShellExecute = false, RedirectStandardInput = true, RedirectStandardOutput = true, RedirectStandardError = true };
+            if (OperatingSystem.IsWindows()) { start.ArgumentList.Add("/d"); start.ArgumentList.Add("/c"); start.ArgumentList.Add("timeout /t 3 /nobreak >nul"); }
+            else { start.ArgumentList.Add("-c"); start.ArgumentList.Add("sleep 3"); }
+            var process = System.Diagnostics.Process.Start(start)!;
+            return new ChildProcess(process, process.StandardInput);
+        }
     }
     private sealed class FakeSupervisor : IProcessSupervisor
     {

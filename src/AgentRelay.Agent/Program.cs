@@ -42,6 +42,7 @@ public sealed class AgentService
     private async Task<object> SubmitAsync(JsonElement json, CancellationToken cancellationToken)
     {
         var request = TaskRequest.Parse(json.GetRawText());
+        using var submissionLease = _store.AcquireSubmissionLease(request.IdempotencyKey);
         if (!_device.Enabled || request.DeviceId != _device.Id || !_device.Roles.Contains(request.Role.ToString().ToLowerInvariant()) ||
             !_device.Repositories.Any(path => SamePath(path, request.Repository)))
             throw new InvalidOperationException("Task identity, role, or repository is not approved.");
@@ -51,11 +52,17 @@ public sealed class AgentService
         {
             var repeated = _store.Submit(request);
             if (repeated.Disposition == TaskSubmissionDisposition.Conflict) throw new InvalidOperationException("Idempotency key conflict.");
-            return repeated;
+            _ = _runner.Reconcile(repeated.TaskId);
+            return _store.FindByTaskId(repeated.TaskId)!.Status;
         }
 
         var accepted = _store.Submit(request);
         if (accepted.Disposition == TaskSubmissionDisposition.Conflict) throw new InvalidOperationException("Idempotency key conflict.");
+        if (accepted.Disposition != TaskSubmissionDisposition.Accepted)
+        {
+            _ = _runner.Reconcile(accepted.TaskId);
+            return _store.FindByTaskId(accepted.TaskId)!.Status;
+        }
         try
         {
             var actualWorkspace = await _worktrees.CreateAsync(request, cancellationToken).ConfigureAwait(false);

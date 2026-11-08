@@ -23,10 +23,17 @@ public sealed class ProcessRunnerTests
         var immediately = runner.GetVerifiedIdentity(request.TaskId);
         Assert.NotNull(immediately);
         await WaitUntilAsync(() => File.Exists(Path.Combine(temp.Path, "logs", request.TaskId + ".log")) &&
-            File.ReadAllText(Path.Combine(temp.Path, "logs", request.TaskId + ".log")).Contains("[redacted]", StringComparison.Ordinal));
+            File.ReadAllText(Path.Combine(temp.Path, "logs", request.TaskId + ".log")).Contains("[redacted]", StringComparison.Ordinal) &&
+            File.ReadAllText(Path.Combine(temp.Path, "logs", request.TaskId + ".log")).Contains("stdout-line", StringComparison.Ordinal));
         Assert.Contains("stdout-line", File.ReadAllText(Path.Combine(temp.Path, "logs", request.TaskId + ".log")));
         Assert.Contains("[redacted]", File.ReadAllText(Path.Combine(temp.Path, "logs", request.TaskId + ".log")));
+        var persistedLog = File.ReadAllText(Path.Combine(temp.Path, "logs", request.TaskId + ".log"));
+        Assert.DoesNotContain("topsecret", persistedLog);
+        Assert.DoesNotContain("jsonsecret", persistedLog);
+        Assert.DoesNotContain("bearersecret", persistedLog);
+        Assert.DoesNotContain("querysecret", persistedLog);
         await WaitUntilAsync(() => File.Exists(Path.Combine(temp.Path, "logs", request.TaskId + ".exitcode")));
+        Assert.False(new SystemProcessSupervisor().IsAlive(store.FindByTaskId(request.TaskId)!.ProcessIdentity!));
         supervisor.Alive = false;
         var recoveredRunner = new ProcessRunner(new TaskStore(Path.Combine(temp.Path, "state")), Path.Combine(temp.Path, "logs"), supervisor);
         Assert.Equal(AgentTaskStatus.Succeeded, recoveredRunner.Reconcile(request.TaskId).Status);
@@ -83,6 +90,36 @@ public sealed class ProcessRunnerTests
     }
 
     [Fact]
+    public void Codex_executable_name_is_resolved_to_absolute_path_for_supervisor()
+    {
+        using var temp = new TemporaryDirectory();
+        var bin = Path.Combine(temp.Path, "bin"); Directory.CreateDirectory(bin);
+        var name = OperatingSystem.IsWindows() ? "codex.exe" : "codex";
+        File.WriteAllText(Path.Combine(bin, name), "fake executable");
+        var executable = ProcessRunner.ResolveExecutable("codex", temp.Path, bin);
+
+        Assert.True(Path.IsPathFullyQualified(executable));
+        Assert.EndsWith(name, executable, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task Task_input_is_redacted_and_removed_after_process_finishes()
+    {
+        using var temp = new TemporaryDirectory();
+        var store = new TaskStore(Path.Combine(temp.Path, "state"));
+        var request = Request("task-secret") with { IdempotencyKey = "Bearer supersecret" };
+        store.Submit(request);
+        var runner = new ProcessRunner(store, Path.Combine(temp.Path, "logs"), launcher: new DeterministicLauncher(temp.Path));
+
+        runner.Start(request, temp.Path);
+
+        var inputPath = Path.Combine(temp.Path, "logs", request.TaskId + ".input.json");
+        Assert.False(File.Exists(inputPath));
+        await WaitUntilAsync(() => File.Exists(Path.Combine(temp.Path, "logs", request.TaskId + ".exitcode")));
+        Assert.Contains("[redacted]", File.ReadAllText(Path.Combine(temp.Path, "logs", request.TaskId + ".log")));
+    }
+
+    [Fact]
     public void Fresh_agent_reconciles_exited_task_from_persisted_identity_and_exit_code()
     {
         using var temp = new TemporaryDirectory();
@@ -131,16 +168,16 @@ public sealed class ProcessRunnerTests
     {
         public ChildProcess Start(ProcessStartInfo ignored)
         {
-            var start = new ProcessStartInfo(OperatingSystem.IsWindows() ? (Environment.GetEnvironmentVariable("ComSpec") ?? "cmd.exe") : "/bin/sh")
+            var start = new ProcessStartInfo(OperatingSystem.IsWindows() ? "powershell.exe" : "/bin/sh")
             { UseShellExecute = false, RedirectStandardInput = true, RedirectStandardOutput = true, RedirectStandardError = true, WorkingDirectory = directory };
             if (OperatingSystem.IsWindows())
             {
-                start.ArgumentList.Add("/d"); start.ArgumentList.Add("/c");
-                start.ArgumentList.Add("echo stdout-line & echo token=topsecret 1>&2 & timeout /t 2 /nobreak >nul & exit /b 0");
+                start.ArgumentList.Add("-NoProfile"); start.ArgumentList.Add("-Command");
+                start.ArgumentList.Add("Write-Output 'stdout-line'; [Console]::Error.WriteLine('token=topsecret'); Write-Output '{\"token\":\"jsonsecret\"}'; Write-Output 'Bearer bearersecret'; Write-Output 'https://host/?access_token=querysecret'; Start-Sleep -Seconds 2; exit 0");
             }
             else
             {
-                start.ArgumentList.Add("-c"); start.ArgumentList.Add("echo stdout-line; echo token=topsecret >&2; sleep 2; exit 0");
+                start.ArgumentList.Add("-c"); start.ArgumentList.Add("echo stdout-line; echo token=topsecret >&2; echo '{\"token\":\"jsonsecret\"}'; echo 'Bearer bearersecret'; echo 'https://host/?access_token=querysecret'; sleep 2; exit 0");
             }
             var process = Process.Start(start)!;
             return new ChildProcess(process, process.StandardInput);
@@ -150,6 +187,15 @@ public sealed class ProcessRunnerTests
     {
         public string Path { get; } = System.IO.Path.Combine(System.IO.Path.GetTempPath(), Guid.NewGuid().ToString("N"));
         public TemporaryDirectory() => Directory.CreateDirectory(Path);
-        public void Dispose() { if (Directory.Exists(Path)) Directory.Delete(Path, recursive: true); }
+        public void Dispose()
+        {
+            if (!Directory.Exists(Path)) return;
+            var deadline = DateTime.UtcNow.AddSeconds(3);
+            while (true)
+            {
+                try { Directory.Delete(Path, recursive: true); return; }
+                catch (IOException) when (DateTime.UtcNow < deadline) { Thread.Sleep(25); }
+            }
+        }
     }
 }
