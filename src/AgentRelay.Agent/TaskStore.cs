@@ -9,7 +9,8 @@ namespace AgentRelay.Agent;
 
 public enum TaskSubmissionDisposition { Accepted, AlreadyAccepted, Conflict }
 public sealed record TaskSubmissionResult(TaskSubmissionDisposition Disposition, string TaskId, TaskStatusRecord Status);
-public sealed record StoredTaskRecord(string SchemaVersion, string RequestHash, TaskRequest Request, TaskStatusRecord Status, TaskReport? Report);
+public sealed record StoredTaskRecord(string SchemaVersion, string RequestHash, TaskRequest Request, TaskStatusRecord Status,
+    TaskReport? Report, ProcessIdentity? ProcessIdentity = null, int? ProcessExitCode = null);
 
 public sealed class TaskStore
 {
@@ -113,6 +114,19 @@ public sealed class TaskStore
         });
     }
 
+    public void WriteProcessIdentity(string taskId, ProcessIdentity identity) => UpdateTask(taskId, record =>
+    {
+        if (identity.ProcessId <= 0 || identity.StartTimeUtcTicks <= 0)
+            throw new InvalidOperationException("Process identity is invalid.");
+        return record with { ProcessIdentity = identity };
+    });
+
+    public void WriteProcessExitCode(string taskId, int exitCode) => UpdateTask(taskId, record =>
+    {
+        if (record.ProcessIdentity is null) throw new InvalidOperationException("No supervised process identity is stored.");
+        return record with { ProcessExitCode = exitCode };
+    });
+
     private void UpdateRecord(string key, Func<StoredTaskRecord, StoredTaskRecord> update)
     {
         Directory.CreateDirectory(_directory);
@@ -125,6 +139,12 @@ public sealed class TaskStore
         if (record.Request.IdempotencyKey != key)
             throw new JsonException("Task record key hash does not match its request.");
         WriteRecord(path, update(record));
+    }
+
+    private void UpdateTask(string taskId, Func<StoredTaskRecord, StoredTaskRecord> update)
+    {
+        var record = FindByTaskId(taskId) ?? throw new InvalidOperationException("No accepted task exists for the supplied task ID.");
+        UpdateRecord(record.Request.IdempotencyKey, update);
     }
 
     private StoredTaskRecord ReadRecord(string path)
@@ -148,6 +168,8 @@ public sealed class TaskStore
                 report.DeviceId != record.Request.DeviceId || report.Status != record.Status.Status)
                 throw new JsonException("Stored task report identity is invalid.");
         }
+        if (record.ProcessIdentity is { } identity && (identity.ProcessId <= 0 || identity.StartTimeUtcTicks <= 0))
+            throw new JsonException("Stored process identity is invalid.");
         return record;
     }
 
