@@ -53,12 +53,15 @@ public sealed class WorktreeManager
         if (Directory.Exists(workspaceRoot) && (File.GetAttributes(workspaceRoot) & FileAttributes.ReparsePoint) != 0)
             throw new InvalidOperationException("Worktree root cannot be a symbolic link or junction.");
         Directory.CreateDirectory(workspaceRoot);
-        var lockDirectory = Path.Combine(workspaceRoot, ".locks");
+        var gitDirectory = GetCommonGitDirectory(repository);
+        var lockDirectory = Path.Combine(gitDirectory, "agentrelay-worktree-locks");
         Directory.CreateDirectory(lockDirectory);
-        if ((File.GetAttributes(workspaceRoot) & FileAttributes.ReparsePoint) != 0 ||
+        if ((File.GetAttributes(gitDirectory) & FileAttributes.ReparsePoint) != 0 ||
             (File.GetAttributes(lockDirectory) & FileAttributes.ReparsePoint) != 0)
-            throw new InvalidOperationException("Worktree root or lock directory cannot be a symbolic link or junction.");
+            throw new InvalidOperationException("Git metadata or worktree lock directory cannot be a symbolic link or junction.");
         var lockPath = Path.Combine(lockDirectory, "root.lock");
+        if (File.Exists(lockPath) && (File.GetAttributes(lockPath) & FileAttributes.ReparsePoint) != 0)
+            throw new InvalidOperationException("Worktree root lock cannot be a symbolic link or junction.");
         using var lease = AcquireWorkspaceLock(lockPath, "worktree root");
         repository = ValidateRepository(request.Repository);
         ValidateWorkspaceRoot(workspaceRoot);
@@ -115,11 +118,23 @@ public sealed class WorktreeManager
     private static void ValidateWorkspaceRoot(string root)
     {
         if (!Directory.Exists(root)) throw new DirectoryNotFoundException("Worktree root is missing.");
-        var locks = Path.Combine(root, ".locks");
-        if (!Directory.Exists(locks)) throw new DirectoryNotFoundException("Worktree lock directory is missing.");
-        foreach (var path in new[] { root, locks })
-            if ((File.GetAttributes(path) & FileAttributes.ReparsePoint) != 0)
-                throw new InvalidOperationException("Worktree root or lock directory cannot be a symbolic link or junction.");
+        if ((File.GetAttributes(root) & FileAttributes.ReparsePoint) != 0)
+            throw new InvalidOperationException("Worktree root cannot be a symbolic link or junction.");
+    }
+
+    private static string GetCommonGitDirectory(string repository)
+    {
+        var start = new ProcessStartInfo("git") { WorkingDirectory = repository, UseShellExecute = false, RedirectStandardOutput = true };
+        start.ArgumentList.Add("rev-parse"); start.ArgumentList.Add("--git-common-dir");
+        using var process = Process.Start(start) ?? throw new InvalidOperationException("Unable to resolve Git metadata directory.");
+        var result = process.StandardOutput.ReadToEnd().Trim();
+        process.WaitForExit();
+        if (process.ExitCode != 0 || string.IsNullOrWhiteSpace(result)) throw new InvalidOperationException("Unable to resolve Git metadata directory.");
+        var full = Path.GetFullPath(result, repository);
+        if (!Directory.Exists(full) || (File.GetAttributes(full) & FileAttributes.ReparsePoint) != 0)
+            throw new InvalidOperationException("Git metadata directory is missing or linked.");
+        RejectReparsePointAncestors(full);
+        return full;
     }
 
     private static string ResolveExistingPath(string path)

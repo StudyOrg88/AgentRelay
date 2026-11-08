@@ -107,6 +107,21 @@ public sealed class WorktreeManagerTests
         await Assert.ThrowsAsync<InvalidOperationException>(() => manager.CreateAsync(Request(repo)));
     }
 
+    [Fact]
+    public async Task Concurrent_distinct_task_worktrees_share_repository_metadata_lock()
+    {
+        using var temp = new TemporaryDirectory();
+        var repo = temp.CreateGitRepository("repo");
+        var manager = new WorktreeManager([repo]);
+        var first = Request(repo);
+        var second = first with { TaskId = "task-two", IdempotencyKey = "key-two", Workspace = Path.Combine(repo, ".agentrelay-worktrees", "task-two"), Branch = "task/two" };
+
+        var paths = await Task.WhenAll(manager.CreateAsync(first), manager.CreateAsync(second));
+
+        Assert.All(paths, path => Assert.True(Directory.Exists(path)));
+        Assert.True(File.Exists(Path.Combine(repo, ".git", "agentrelay-worktree-locks", "root.lock")));
+    }
+
     private static TaskRequest Request(string repo) => new(TaskContract.SchemaVersion, "task-one", "key-one",
         "https://github.com/acme/repo/issues/1", AgentRelayRole.Worker, "device-a", repo,
         Path.Combine(repo, ".agentrelay-worktrees", "task-one"), "task/one", 1);

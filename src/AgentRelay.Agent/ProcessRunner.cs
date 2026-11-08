@@ -12,7 +12,7 @@ public interface IProcessSupervisor
 {
     bool IsAlive(ProcessIdentity identity);
     void Terminate(ProcessIdentity identity);
-    int? ReadExitCode(ProcessIdentity identity, string exitCodePath);
+    int? ReadExitCode(ProcessIdentity identity, string exitCodePath, string taskId, string launchToken);
 }
 
 public sealed record ChildProcess(Process Process, StreamWriter StandardInput);
@@ -54,14 +54,15 @@ public sealed class SystemProcessSupervisor : IProcessSupervisor
         process.Kill(entireProcessTree: true);
     }
 
-    public int? ReadExitCode(ProcessIdentity identity, string exitCodePath)
+    public int? ReadExitCode(ProcessIdentity identity, string exitCodePath, string taskId, string launchToken)
     {
         try
         {
             if (!File.Exists(exitCodePath)) return null;
             var fields = File.ReadAllText(exitCodePath).Split(':');
-            return fields.Length == 2 && int.TryParse(fields[0], out var pid) &&
-                int.TryParse(fields[1], out var code) && pid == identity.ProcessId ? code : null;
+            return fields.Length == 5 && fields[0] == taskId && fields[1] == launchToken &&
+                int.TryParse(fields[2], out var pid) && long.TryParse(fields[3], out var ticks) &&
+                int.TryParse(fields[4], out var code) && pid == identity.ProcessId && ticks == identity.StartTimeUtcTicks ? code : null;
         }
         catch (IOException) { return null; }
     }
@@ -96,7 +97,31 @@ public sealed class ProcessRunner
             if (_supervisor.IsAlive(previous)) return previous;
             if (File.Exists(ExitCodePath(request.TaskId)))
                 throw new InvalidOperationException("Task process already exited; reconcile it instead of launching it again.");
+            if (prior.LaunchToken is null)
+                throw new InvalidOperationException("Task has a legacy process identity without a launch token; refusing duplicate launch.");
         }
+        var launchToken = prior.LaunchToken;
+        if (launchToken is not null)
+        {
+            var recovered = ReadLaunchIdentity(request.TaskId, launchToken);
+            if (recovered is { } recoveredIdentity)
+            {
+                if (_supervisor.IsAlive(recoveredIdentity))
+                {
+                    PersistIdentity(request.TaskId, recoveredIdentity);
+                    _store.WriteStatus(prior.Status with { Status = AgentTaskStatus.Running, UpdatedAt = DateTimeOffset.UtcNow });
+                    return recoveredIdentity;
+                }
+                _store.WriteProcessIdentity(request.TaskId, recoveredIdentity);
+                if (_supervisor.ReadExitCode(recoveredIdentity, ExitCodePath(request.TaskId), request.TaskId, launchToken) is not null)
+                    _ = Reconcile(request.TaskId);
+                else
+                    throw new InvalidOperationException("The task launched under its persisted token but has no completed exit marker; refusing duplicate launch.");
+                return recoveredIdentity;
+            }
+            throw new InvalidOperationException("A persisted launch token has no verifiable launch identity; refusing duplicate launch.");
+        }
+        launchToken = _store.WriteLaunchToken(request.TaskId);
         Directory.CreateDirectory(_logDirectory);
         var logPath = LogPath(request.TaskId);
         var rolePrompt = request.Role == AgentRelayRole.Worker
@@ -112,7 +137,7 @@ public sealed class ProcessRunner
             var selectedLauncher = launcher ?? _launcher;
             if (selectedLauncher is SystemChildProcessLauncher)
             {
-                process = StartDetachedSupervisor(request, workingDirectory, inputPath, logPath);
+                process = StartDetachedSupervisor(request, workingDirectory, inputPath, logPath, launchToken);
             }
             else
             {
@@ -128,6 +153,7 @@ public sealed class ProcessRunner
                 _ = PersistTestChildExitAsync(process, request.TaskId);
             }
             var identity = new ProcessIdentity(process.Id, process.StartTime.ToUniversalTime().Ticks);
+            WriteLaunchIdentity(request.TaskId, launchToken, identity);
             PersistIdentity(request.TaskId, identity);
             AfterIdentityPersisted?.Invoke();
             _store.WriteStatus(new TaskStatusRecord(TaskContract.SchemaVersion, request.TaskId, request.IdempotencyKey,
@@ -155,7 +181,8 @@ public sealed class ProcessRunner
         if (IsTerminal(record.Status.Status)) return record.Status;
         if (record.ProcessIdentity is null) return record.Status;
         if (_supervisor.IsAlive(record.ProcessIdentity)) return record.Status;
-        var exitCode = record.ProcessExitCode ?? _supervisor.ReadExitCode(record.ProcessIdentity, ExitCodePath(taskId));
+        if (record.LaunchToken is null) return record.Status;
+        var exitCode = record.ProcessExitCode ?? _supervisor.ReadExitCode(record.ProcessIdentity, ExitCodePath(taskId), taskId, record.LaunchToken);
         if (exitCode is null) return record.Status;
         if (record.ProcessExitCode is null) _store.WriteProcessExitCode(taskId, exitCode.Value);
         SanitizeCompletedLogs(taskId);
@@ -208,18 +235,19 @@ public sealed class ProcessRunner
         await process.WaitForExitAsync().ConfigureAwait(false);
         process.WaitForExit();
         var identity = new ProcessIdentity(process.Id, process.StartTime.ToUniversalTime().Ticks);
-        File.WriteAllText(ExitCodePath(taskId), $"{identity.ProcessId}:{process.ExitCode}");
+        var record = _store.FindByTaskId(taskId)!;
+        File.WriteAllText(ExitCodePath(taskId), $"{taskId}:{record.LaunchToken}:{identity.ProcessId}:{identity.StartTimeUtcTicks}:{process.ExitCode}");
         process.Dispose();
     }
 
-    private Process StartDetachedSupervisor(TaskRequest request, string workingDirectory, string inputPath, string logPath)
+    private Process StartDetachedSupervisor(TaskRequest request, string workingDirectory, string inputPath, string logPath, string launchToken)
     {
         var codexExecutable = ResolveExecutable(_codexExecutable, workingDirectory, Environment.GetEnvironmentVariable("PATH") ?? string.Empty);
         var scriptPath = SupervisorScriptPath(request.TaskId);
         if (OperatingSystem.IsWindows())
         {
             var childIdentityPath = IdentityPath(request.TaskId) + ".child";
-            File.WriteAllText(scriptPath, "$ErrorActionPreference='Stop'; try { $p=Start-Process -FilePath $env:AGENTRELAY_CODEX -ArgumentList @('exec','--json','-') -WorkingDirectory $env:AGENTRELAY_WORKDIR -RedirectStandardInput $env:AGENTRELAY_INPUT -RedirectStandardOutput $env:AGENTRELAY_OUT -RedirectStandardError $env:AGENTRELAY_ERR -PassThru; $ticks=$p.StartTime.ToUniversalTime().Ticks; \"$ticks`:$($p.Id)\" | Set-Content -NoNewline $env:AGENTRELAY_IDENTITY; $p.WaitForExit(); $p.Refresh(); foreach($line in (Get-Content $env:AGENTRELAY_OUT) + (Get-Content $env:AGENTRELAY_ERR)) { $line -replace '(?i)(token|password|secret|authorization)(\\s*[:=]\\s*)[^\\s,;]+', '$1$2[redacted]' | Add-Content $env:AGENTRELAY_LOG }; $tmp=$env:AGENTRELAY_EXIT+'.tmp'; [System.IO.File]::WriteAllText($tmp, \"$($p.Id):$($p.ExitCode)\"); Move-Item -Force $tmp $env:AGENTRELAY_EXIT; Remove-Item -Force $env:AGENTRELAY_INPUT } catch { $_.ToString() | Set-Content -NoNewline ($env:AGENTRELAY_IDENTITY+'.error'); exit 1 }");
+            File.WriteAllText(scriptPath, "$ErrorActionPreference='Stop'; try { $p=Start-Process -FilePath $env:AGENTRELAY_CODEX -ArgumentList @('exec','--json','-') -WorkingDirectory $env:AGENTRELAY_WORKDIR -RedirectStandardInput $env:AGENTRELAY_INPUT -RedirectStandardOutput $env:AGENTRELAY_OUT -RedirectStandardError $env:AGENTRELAY_ERR -PassThru; $ticks=$p.StartTime.ToUniversalTime().Ticks; \"$env:AGENTRELAY_TASK`:$env:AGENTRELAY_TOKEN`:$($p.Id)`:$ticks\" | Set-Content -NoNewline $env:AGENTRELAY_IDENTITY; $p.WaitForExit(); $p.Refresh(); $exitCode=[int]$p.ExitCode; foreach($line in (Get-Content $env:AGENTRELAY_OUT) + (Get-Content $env:AGENTRELAY_ERR)) { $line -replace '(?i)(token|password|secret|authorization)(\\s*[:=]\\s*)[^\\s,;]+', '$1$2[redacted]' | Add-Content $env:AGENTRELAY_LOG }; $tmp=$env:AGENTRELAY_EXIT+'.tmp'; [System.IO.File]::WriteAllText($tmp, \"$env:AGENTRELAY_TASK`:$env:AGENTRELAY_TOKEN`:$($p.Id)`:$ticks`:$exitCode\"); Move-Item -Force $tmp $env:AGENTRELAY_EXIT; Remove-Item -Force $env:AGENTRELAY_INPUT } catch { $_.ToString() | Set-Content -NoNewline ($env:AGENTRELAY_IDENTITY+'.error'); exit 1 }");
             var start = new ProcessStartInfo("powershell.exe") { UseShellExecute = false, CreateNoWindow = true, RedirectStandardError = true, RedirectStandardOutput = true, WorkingDirectory = workingDirectory };
             start.ArgumentList.Add("-NoProfile"); start.ArgumentList.Add("-NonInteractive"); start.ArgumentList.Add("-ExecutionPolicy"); start.ArgumentList.Add("Bypass"); start.ArgumentList.Add("-File"); start.ArgumentList.Add(scriptPath);
             start.Environment["AGENTRELAY_CODEX"] = codexExecutable;
@@ -230,6 +258,8 @@ public sealed class ProcessRunner
             start.Environment["AGENTRELAY_ERR"] = logPath + ".stderr";
             start.Environment["AGENTRELAY_EXIT"] = ExitCodePath(request.TaskId);
             start.Environment["AGENTRELAY_IDENTITY"] = childIdentityPath;
+            start.Environment["AGENTRELAY_TASK"] = request.TaskId;
+            start.Environment["AGENTRELAY_TOKEN"] = launchToken;
             using var supervisor = Process.Start(start) ?? throw new InvalidOperationException("Unable to start detached task supervisor.");
             var identityDeadline = DateTime.UtcNow.AddSeconds(10);
             while (!File.Exists(childIdentityPath) && !supervisor.HasExited && DateTime.UtcNow < identityDeadline) Thread.Sleep(10);
@@ -242,17 +272,28 @@ public sealed class ProcessRunner
                 throw new InvalidOperationException("Task supervisor failed to persist its child process identity: " + detail);
             }
             var pieces = File.ReadAllText(childIdentityPath).Split(':');
-            var childIdentity = new ProcessIdentity(int.Parse(pieces[1]), long.Parse(pieces[0]));
-            return Process.GetProcessById(childIdentity.ProcessId);
+            if (pieces.Length != 4 || pieces[0] != request.TaskId || pieces[1] != launchToken)
+                throw new InvalidOperationException("Supervisor launch identity did not match its task token.");
+            var childIdentity = new ProcessIdentity(int.Parse(pieces[2]), long.Parse(pieces[3]));
+            WriteLaunchIdentity(request.TaskId, launchToken, childIdentity);
+            var childProcess = Process.GetProcessById(childIdentity.ProcessId);
+            if (childProcess.StartTime.ToUniversalTime().Ticks != childIdentity.StartTimeUtcTicks)
+            {
+                childProcess.Dispose();
+                throw new InvalidOperationException("Supervisor PID was reused or its start time did not match the launch sidecar.");
+            }
+            return childProcess;
         }
 
         var pidFile = IdentityPath(request.TaskId) + ".pid";
-        File.WriteAllText(scriptPath, "#!/bin/bash\ninput=$1; log=$2; exitfile=$3; codex=$4; pidfile=$5\n\"$codex\" exec --json - < \"$input\" > >(sed -E 's/(token|password|secret|authorization)([[:space:]]*[:=][[:space:]]*)[^[:space:],;]+/\\1\\2[redacted]/Ig' >> \"$log\") 2> >(sed -E 's/(token|password|secret|authorization)([[:space:]]*[:=][[:space:]]*)[^[:space:],;]+/\\1\\2[redacted]/Ig' >> \"$log\") &\nchild=$!\nprintf '%s' \"$child\" > \"$pidfile.tmp\"\nmv -f \"$pidfile.tmp\" \"$pidfile\"\nwait \"$child\"; code=$?\nprintf '%s:%s' \"$child\" \"$code\" > \"$exitfile.tmp\"\nmv -f \"$exitfile.tmp\" \"$exitfile\"\nexit \"$code\"\n");
+        var launchPath = LaunchIdentityPath(request.TaskId);
+        File.WriteAllText(scriptPath, "#!/bin/bash\ninput=$1; log=$2; exitfile=$3; codex=$4; pidfile=$5; task=$6; token=$7; launchfile=$8\nAGENTRELAY_LAUNCH_TOKEN=\"$token\" \"$codex\" exec --json - < \"$input\" > >(sed -E 's/(token|password|secret|authorization)([[:space:]]*[:=][[:space:]]*)[^[:space:],;]+/\\1\\2[redacted]/Ig' >> \"$log\") 2> >(sed -E 's/(token|password|secret|authorization)([[:space:]]*[:=][[:space:]]*)[^[:space:],;]+/\\1\\2[redacted]/Ig' >> \"$log\") &\nchild=$!\nprintf '%s' \"$child\" > \"$pidfile.tmp\"\nmv -f \"$pidfile.tmp\" \"$pidfile\"\nwhile [ ! -f \"$launchfile\" ]; do sleep 0.01; done\nwait \"$child\"; code=$?\nIFS=: read -r task token pid ticks < \"$launchfile\"\nprintf '%s:%s:%s:%s:%s' \"$task\" \"$token\" \"$pid\" \"$ticks\" \"$code\" > \"$exitfile.tmp\"\nmv -f \"$exitfile.tmp\" \"$exitfile\"\nexit \"$code\"\n");
         var chmod = new ProcessStartInfo("chmod") { UseShellExecute = false };
         chmod.ArgumentList.Add("+x"); chmod.ArgumentList.Add(scriptPath);
         using (var permission = Process.Start(chmod) ?? throw new InvalidOperationException("Unable to prepare task supervisor.")) permission.WaitForExit();
         var unix = new ProcessStartInfo("setsid") { UseShellExecute = false, CreateNoWindow = true, WorkingDirectory = workingDirectory, RedirectStandardInput = false, RedirectStandardOutput = false, RedirectStandardError = false };
         unix.ArgumentList.Add(scriptPath); unix.ArgumentList.Add(inputPath); unix.ArgumentList.Add(logPath); unix.ArgumentList.Add(ExitCodePath(request.TaskId)); unix.ArgumentList.Add(codexExecutable); unix.ArgumentList.Add(pidFile);
+        unix.ArgumentList.Add(request.TaskId); unix.ArgumentList.Add(launchToken); unix.ArgumentList.Add(launchPath);
         using var unixSupervisor = Process.Start(unix) ?? throw new InvalidOperationException("Unable to start detached task supervisor.");
         var deadline = DateTime.UtcNow.AddSeconds(10);
         while (!File.Exists(pidFile) && DateTime.UtcNow < deadline) Thread.Sleep(10);
@@ -261,10 +302,30 @@ public sealed class ProcessRunner
         try
         {
             var child = Process.GetProcessById(childPid);
+            var identity = new ProcessIdentity(child.Id, child.StartTime.ToUniversalTime().Ticks);
+            WriteLaunchIdentity(request.TaskId, launchToken, identity);
             return child;
         }
         catch (ArgumentException) when (File.Exists(ExitCodePath(request.TaskId)))
         { throw new InvalidOperationException("Task exited before its process identity could be observed."); }
+    }
+
+    private ProcessIdentity? ReadLaunchIdentity(string taskId, string launchToken)
+    {
+        var path = LaunchIdentityPath(taskId);
+        if (!File.Exists(path)) return null;
+        var fields = File.ReadAllText(path).Split(':');
+        if (fields.Length != 4 || fields[0] != taskId || fields[1] != launchToken ||
+            !int.TryParse(fields[2], out var pid) || !long.TryParse(fields[3], out var ticks))
+            throw new InvalidOperationException("Persisted launch identity does not match this task and launch token.");
+        return new ProcessIdentity(pid, ticks);
+    }
+
+    private void WriteLaunchIdentity(string taskId, string launchToken, ProcessIdentity identity)
+    {
+        var temporary = LaunchIdentityPath(taskId) + ".tmp";
+        File.WriteAllText(temporary, $"{taskId}:{launchToken}:{identity.ProcessId}:{identity.StartTimeUtcTicks}");
+        File.Move(temporary, LaunchIdentityPath(taskId), overwrite: true);
     }
 
     public static string ResolveExecutable(string executable, string workingDirectory, string? path = null)
@@ -295,6 +356,7 @@ public sealed class ProcessRunner
     }
 
     private string IdentityPath(string taskId) => Path.Combine(_logDirectory, taskId + ".process.json");
+    private string LaunchIdentityPath(string taskId) => Path.Combine(_logDirectory, taskId + ".launch");
     private string LogPath(string taskId) => Path.Combine(_logDirectory, taskId + ".log");
     private string ExitCodePath(string taskId) => Path.Combine(_logDirectory, taskId + ".exitcode");
     private string InputPath(string taskId) => Path.Combine(_logDirectory, taskId + ".input.json");
