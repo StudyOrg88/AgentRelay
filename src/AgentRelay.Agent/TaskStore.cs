@@ -10,7 +10,7 @@ namespace AgentRelay.Agent;
 public enum TaskSubmissionDisposition { Accepted, AlreadyAccepted, Conflict }
 public sealed record TaskSubmissionResult(TaskSubmissionDisposition Disposition, string TaskId, TaskStatusRecord Status);
 public sealed record StoredTaskRecord(string SchemaVersion, string RequestHash, TaskRequest Request, TaskStatusRecord Status,
-    TaskReport? Report, ProcessIdentity? ProcessIdentity = null, int? ProcessExitCode = null);
+    TaskReport? Report, ProcessIdentity? ProcessIdentity = null, int? ProcessExitCode = null, string? LaunchToken = null);
 
 public sealed class TaskStore
 {
@@ -127,10 +127,20 @@ public sealed class TaskStore
 
     public void WriteProcessIdentity(string taskId, ProcessIdentity identity) => UpdateTask(taskId, record =>
     {
+        BeforeWriteProcessIdentity?.Invoke();
         if (identity.ProcessId <= 0 || identity.StartTimeUtcTicks <= 0)
             throw new InvalidOperationException("Process identity is invalid.");
         return record with { ProcessIdentity = identity };
     });
+
+    public Action? BeforeWriteProcessIdentity { get; set; }
+
+    public string WriteLaunchToken(string taskId)
+    {
+        var token = Guid.NewGuid().ToString("N");
+        UpdateTask(taskId, record => record.LaunchToken is null ? record with { LaunchToken = token } : record);
+        return FindByTaskId(taskId)!.LaunchToken!;
+    }
 
     public void WriteProcessExitCode(string taskId, int exitCode) => UpdateTask(taskId, record =>
     {
@@ -181,6 +191,8 @@ public sealed class TaskStore
         }
         if (record.ProcessIdentity is { } identity && (identity.ProcessId <= 0 || identity.StartTimeUtcTicks <= 0))
             throw new JsonException("Stored process identity is invalid.");
+        if (record.LaunchToken is not null && !System.Text.RegularExpressions.Regex.IsMatch(record.LaunchToken, "\\A[a-f0-9]{32}\\z"))
+            throw new JsonException("Stored launch token is invalid.");
         return record;
     }
 

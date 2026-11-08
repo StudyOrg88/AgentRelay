@@ -138,7 +138,51 @@ public sealed class ProcessRunnerTests
         await WaitUntilAsync(() => File.Exists(Path.Combine(temp.Path, "logs", request.TaskId + ".exitcode")));
         await WaitUntilAsync(() => !new SystemProcessSupervisor().IsAlive(identity));
         Assert.Equal(AgentTaskStatus.Failed, runner.Reconcile(request.TaskId).Status);
-        Assert.Equal($"{identity.ProcessId}:7", File.ReadAllText(Path.Combine(temp.Path, "logs", request.TaskId + ".exitcode")));
+        var launchToken = store.FindByTaskId(request.TaskId)!.LaunchToken!;
+        Assert.Equal($"{request.TaskId}:{launchToken}:{identity.ProcessId}:{identity.StartTimeUtcTicks}:7", File.ReadAllText(Path.Combine(temp.Path, "logs", request.TaskId + ".exitcode")));
+    }
+
+    [Fact]
+    public async Task Windows_production_supervisor_binds_child_identity_and_exit_marker()
+    {
+        if (!OperatingSystem.IsWindows()) return;
+        using var temp = new TemporaryDirectory();
+        var where = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), "where.exe");
+        Assert.True(File.Exists(where));
+        var store = new TaskStore(Path.Combine(temp.Path, "state"));
+        var request = Request("task-windows-production"); store.Submit(request);
+        var logs = Path.Combine(temp.Path, "logs");
+        var runner = new ProcessRunner(store, logs, codexExecutable: "where");
+
+        var identity = runner.Start(request, temp.Path);
+        var task = store.FindByTaskId(request.TaskId)!;
+        Assert.Equal(identity, task.ProcessIdentity);
+        await WaitUntilAsync(() => File.Exists(Path.Combine(logs, request.TaskId + ".exitcode")));
+        var marker = File.ReadAllText(Path.Combine(logs, request.TaskId + ".exitcode"));
+        Assert.True(new SystemProcessSupervisor().ReadExitCode(identity,
+            Path.Combine(logs, request.TaskId + ".exitcode"), request.TaskId, task.LaunchToken!) == 0, marker);
+        Assert.Null(new SystemProcessSupervisor().ReadExitCode(identity with { StartTimeUtcTicks = identity.StartTimeUtcTicks + 1 },
+            Path.Combine(logs, request.TaskId + ".exitcode"), request.TaskId, task.LaunchToken!));
+        Assert.Null(new SystemProcessSupervisor().ReadExitCode(identity, Path.Combine(logs, request.TaskId + ".exitcode"),
+            request.TaskId, task.LaunchToken + "wrong"));
+    }
+
+    [Fact]
+    public void Exit_marker_rejects_pid_reuse_and_task_or_token_mismatch()
+    {
+        using var temp = new TemporaryDirectory();
+        var identity = new ProcessIdentity(444, 555);
+        var path = Path.Combine(temp.Path, "task.exitcode");
+        var supervisor = new SystemProcessSupervisor();
+        File.WriteAllText(path, "task-a:token-a:444:556:0");
+
+        Assert.Null(supervisor.ReadExitCode(identity, path, "task-a", "token-a"));
+        File.WriteAllText(path, "task-b:token-a:444:555:0");
+        Assert.Null(supervisor.ReadExitCode(identity, path, "task-a", "token-a"));
+        File.WriteAllText(path, "task-a:token-b:444:555:0");
+        Assert.Null(supervisor.ReadExitCode(identity, path, "task-a", "token-a"));
+        File.WriteAllText(path, "task-a:token-a:444:555:0");
+        Assert.Equal(0, supervisor.ReadExitCode(identity, path, "task-a", "token-a"));
     }
 
     [Fact]
@@ -152,8 +196,9 @@ public sealed class ProcessRunnerTests
         store.Submit(request);
         store.WriteStatus(Running(request));
         Directory.CreateDirectory(logs);
+        var launchToken = store.WriteLaunchToken(request.TaskId);
         store.WriteProcessIdentity(request.TaskId, new ProcessIdentity(321, 777));
-        File.WriteAllText(Path.Combine(logs, request.TaskId + ".exitcode"), "0");
+        File.WriteAllText(Path.Combine(logs, request.TaskId + ".exitcode"), $"{request.TaskId}:{launchToken}:321:777:0");
         var runner = new ProcessRunner(new TaskStore(stateDir), logs, new FakeSupervisor { Alive = false });
 
         var status = runner.Reconcile(request.TaskId);
@@ -184,7 +229,14 @@ public sealed class ProcessRunnerTests
         public List<ProcessIdentity> Terminated { get; } = [];
         public bool IsAlive(ProcessIdentity identity) => Alive;
         public void Terminate(ProcessIdentity identity) => Terminated.Add(identity);
-        public int? ReadExitCode(ProcessIdentity identity, string exitCodePath) => File.Exists(exitCodePath) && int.TryParse(File.ReadAllText(exitCodePath).Split(':').Last(), out var code) ? code : null;
+        public int? ReadExitCode(ProcessIdentity identity, string exitCodePath, string taskId, string launchToken)
+        {
+            if (!File.Exists(exitCodePath)) return null;
+            var fields = File.ReadAllText(exitCodePath).Split(':');
+            return fields.Length == 5 && fields[0] == taskId && fields[1] == launchToken &&
+                int.TryParse(fields[2], out var pid) && long.TryParse(fields[3], out var ticks) &&
+                int.TryParse(fields[4], out var code) && pid == identity.ProcessId && ticks == identity.StartTimeUtcTicks ? code : null;
+        }
     }
     private sealed class DeterministicLauncher(string directory) : IChildProcessLauncher
     {

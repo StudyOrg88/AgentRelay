@@ -113,17 +113,17 @@ public sealed class AgentCliTests
         var launcher = new CountingLauncher();
         var runner = new ProcessRunner(store, Path.Combine(temp.Path, "logs"), launcher: launcher);
         var failOnce = true;
-        runner.AfterIdentityPersisted = () =>
+        store.BeforeWriteProcessIdentity = () =>
         {
             if (!failOnce) return;
             failOnce = false;
-            throw new InvalidOperationException("injected failure after durable process identity");
+            throw new IOException("injected WriteProcessIdentity failure");
         };
         var service = new AgentService(device, store, new WorktreeManager([repo]), runner);
 
-        await Assert.ThrowsAsync<InvalidOperationException>(() => service.ExecuteAsync("submit", request.ToJson()));
+        await Assert.ThrowsAsync<IOException>(() => service.ExecuteAsync("submit", request.ToJson()));
         Assert.Equal(AgentTaskStatus.Starting, store.FindByTaskId(request.TaskId)!.Status.Status);
-        Assert.NotNull(store.FindByTaskId(request.TaskId)!.ProcessIdentity);
+        Assert.Null(store.FindByTaskId(request.TaskId)!.ProcessIdentity);
 
         using var response = JsonDocument.Parse(await service.ExecuteAsync("submit", request.ToJson()));
         Assert.Equal("running", response.RootElement.GetProperty("status").GetString());
@@ -171,8 +171,10 @@ public sealed class AgentCliTests
         store.Submit(request);
         store.WriteStatus(new TaskStatusRecord(TaskContract.SchemaVersion, request.TaskId, request.IdempotencyKey,
             request.DeviceId, AgentTaskStatus.Running, DateTimeOffset.UtcNow));
-        store.WriteProcessIdentity(request.TaskId, new ProcessIdentity(515, 1234));
-        File.WriteAllText(Path.Combine(logs, request.TaskId + ".exitcode"), "0");
+        var identity = new ProcessIdentity(515, 1234);
+        var launchToken = store.WriteLaunchToken(request.TaskId);
+        store.WriteProcessIdentity(request.TaskId, identity);
+        File.WriteAllText(Path.Combine(logs, request.TaskId + ".exitcode"), $"{request.TaskId}:{launchToken}:{identity.ProcessId}:{identity.StartTimeUtcTicks}:0");
         var supervisor = new FakeSupervisor { Alive = false };
         var service = new AgentService(device, new TaskStore(statePath), new WorktreeManager([repo]), new ProcessRunner(new TaskStore(statePath), logs, supervisor));
 
@@ -193,7 +195,7 @@ public sealed class AgentCliTests
     {
         public bool IsAlive(ProcessIdentity identity) => false;
         public void Terminate(ProcessIdentity identity) => throw new InvalidOperationException();
-        public int? ReadExitCode(ProcessIdentity identity, string exitCodePath) => null;
+        public int? ReadExitCode(ProcessIdentity identity, string exitCodePath, string taskId, string launchToken) => null;
     }
     private sealed class CountingLauncher : IChildProcessLauncher
     {
@@ -214,7 +216,14 @@ public sealed class AgentCliTests
         public bool Alive { get; set; } = true;
         public bool IsAlive(ProcessIdentity identity) => Alive;
         public void Terminate(ProcessIdentity identity) { }
-        public int? ReadExitCode(ProcessIdentity identity, string path) => File.Exists(path) && int.TryParse(File.ReadAllText(path).Split(':').Last(), out var code) ? code : null;
+        public int? ReadExitCode(ProcessIdentity identity, string path, string taskId, string launchToken)
+        {
+            if (!File.Exists(path)) return null;
+            var fields = File.ReadAllText(path).Split(':');
+            return fields.Length == 5 && fields[0] == taskId && fields[1] == launchToken &&
+                int.TryParse(fields[2], out var pid) && long.TryParse(fields[3], out var ticks) &&
+                int.TryParse(fields[4], out var code) && pid == identity.ProcessId && ticks == identity.StartTimeUtcTicks ? code : null;
+        }
     }
     private sealed class TemporaryDirectory : IDisposable
     {
