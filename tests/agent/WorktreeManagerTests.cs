@@ -46,6 +46,54 @@ public sealed class WorktreeManagerTests
         Assert.True(Directory.Exists(second));
     }
 
+    [Fact]
+    public void Repository_reached_through_symlinked_ancestor_is_rejected()
+    {
+        using var temp = new TemporaryDirectory();
+        var realRoot = Path.Combine(temp.Path, "real"); Directory.CreateDirectory(realRoot);
+        var repo = temp.CreateGitRepository("real/repo");
+        var alias = Path.Combine(temp.Path, "alias");
+        Directory.CreateSymbolicLink(alias, realRoot);
+        var manager = new WorktreeManager([Path.Combine(alias, "repo")]);
+
+        Assert.Throws<InvalidOperationException>(() => manager.ValidateRepository(Path.Combine(alias, "repo")));
+    }
+
+    [Fact]
+    public async Task Linked_worktree_repository_with_git_file_can_create_task_worktree()
+    {
+        using var temp = new TemporaryDirectory();
+        var source = temp.CreateGitRepository("source");
+        var linked = Path.Combine(temp.Path, "linked");
+        var add = new System.Diagnostics.ProcessStartInfo("git") { WorkingDirectory = source, UseShellExecute = false };
+        add.ArgumentList.Add("worktree"); add.ArgumentList.Add("add"); add.ArgumentList.Add("--detach"); add.ArgumentList.Add(linked); add.ArgumentList.Add("HEAD");
+        using (var process = System.Diagnostics.Process.Start(add)!) { process.WaitForExit(); Assert.Equal(0, process.ExitCode); }
+        Assert.True(File.Exists(Path.Combine(linked, ".git")));
+
+        var request = Request(linked) with { Branch = "task/linked" };
+        var workspace = await new WorktreeManager([linked]).CreateAsync(request);
+
+        Assert.True(Directory.Exists(workspace));
+    }
+
+    [Fact]
+    public async Task Concurrent_duplicate_worktree_creation_is_rejected_under_workspace_lock()
+    {
+        using var temp = new TemporaryDirectory();
+        var repo = temp.CreateGitRepository("repo");
+        var manager = new WorktreeManager([repo]);
+        var request = Request(repo);
+
+        var results = await Task.WhenAll(Enumerable.Range(0, 2).Select(async _ =>
+        {
+            try { return await manager.CreateAsync(request); }
+            catch (InvalidOperationException) { return null; }
+        }));
+
+        Assert.Single(results, result => result is not null);
+        Assert.True(Directory.Exists(request.Workspace));
+    }
+
     private static TaskRequest Request(string repo) => new(TaskContract.SchemaVersion, "task-one", "key-one",
         "https://github.com/acme/repo/issues/1", AgentRelayRole.Worker, "device-a", repo,
         Path.Combine(repo, ".agentrelay-worktrees", "task-one"), "task/one", 1);

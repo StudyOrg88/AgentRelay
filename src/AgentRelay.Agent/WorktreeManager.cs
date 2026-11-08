@@ -18,6 +18,7 @@ public sealed class WorktreeManager
     public string ValidateRepository(string repository)
     {
         var full = Path.GetFullPath(repository);
+        RejectReparsePointAncestors(full);
         if (!_repositories.Any(root => SamePath(root, full)) || !Directory.Exists(full) ||
             !Directory.Exists(Path.Combine(full, ".git")) && !File.Exists(Path.Combine(full, ".git")))
             throw new InvalidOperationException("Repository is not allowlisted or is not a Git repository.");
@@ -34,6 +35,11 @@ public sealed class WorktreeManager
             throw new InvalidOperationException("Worktree root cannot be a symbolic link or junction.");
         var expected = Path.GetFullPath(Path.Combine(worktreeRoot, request.TaskId));
         var actual = Path.GetFullPath(request.Workspace);
+        if (Directory.Exists(actual) || File.Exists(actual))
+        {
+            var resolved = ResolveExistingPath(actual);
+            if (!SamePath(resolved, actual)) throw new InvalidOperationException("Workspace resolves outside its registered lexical path.");
+        }
         if (!SamePath(expected, actual) || !IsContained(actual, Path.Combine(repository, ".agentrelay-worktrees")))
             throw new InvalidOperationException("Workspace must be the task-specific child of the approved repository.");
         return actual;
@@ -42,9 +48,17 @@ public sealed class WorktreeManager
     public async Task<string> CreateAsync(TaskRequest request, CancellationToken cancellationToken = default)
     {
         var repository = ValidateRepository(request.Repository);
+        var workspaceRoot = Path.Combine(repository, ".agentrelay-worktrees");
+        Directory.CreateDirectory(workspaceRoot);
+        var lockDirectory = Path.Combine(workspaceRoot, ".locks");
+        Directory.CreateDirectory(lockDirectory);
+        var lockPath = Path.Combine(lockDirectory, Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(request.TaskId))) + ".lock");
+        using var lease = AcquireWorkspaceLock(lockPath, request.TaskId);
+        repository = ValidateRepository(request.Repository);
         var workspace = ValidateWorkspace(request);
         Directory.CreateDirectory(Path.GetDirectoryName(workspace)!);
         if (Directory.Exists(workspace) || File.Exists(workspace)) throw new InvalidOperationException("Task workspace already exists.");
+        if (BranchExists(repository, request.Branch)) throw new InvalidOperationException("Task branch already exists.");
         var start = new ProcessStartInfo("git")
         {
             WorkingDirectory = repository,
@@ -68,6 +82,59 @@ public sealed class WorktreeManager
         }
         _ = await stdout.ConfigureAwait(false);
         return workspace;
+    }
+
+    private static string ResolveExistingPath(string path)
+    {
+        var full = Path.GetFullPath(path);
+        var root = Path.GetPathRoot(full) ?? throw new ArgumentException("Path must be rooted.", nameof(path));
+        var resolved = root;
+        foreach (var part in full[root.Length..].Split([Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar], StringSplitOptions.RemoveEmptyEntries))
+        {
+            var next = Path.Combine(resolved, part);
+            if (!Directory.Exists(next) && !File.Exists(next)) throw new DirectoryNotFoundException("Approved repository path does not exist.");
+            FileSystemInfo item = Directory.Exists(next) ? new DirectoryInfo(next) : new FileInfo(next);
+            var target = item.ResolveLinkTarget(returnFinalTarget: true);
+            if (target is not null) throw new InvalidOperationException("Path contains a symbolic link or junction.");
+            resolved = item.FullName;
+        }
+        return Path.GetFullPath(resolved);
+    }
+
+    private static void RejectReparsePointAncestors(string path)
+    {
+        var full = Path.GetFullPath(path);
+        for (var current = full; !string.IsNullOrEmpty(current); current = Path.GetDirectoryName(current)!)
+        {
+            if (!Directory.Exists(current)) continue;
+            if ((File.GetAttributes(current) & FileAttributes.ReparsePoint) != 0)
+                throw new InvalidOperationException("Repository path cannot contain a symbolic link or junction.");
+            var parent = Path.GetDirectoryName(current);
+            if (parent == current) break;
+        }
+    }
+
+    private static FileStream AcquireWorkspaceLock(string lockPath, string taskId)
+    {
+        var deadline = DateTime.UtcNow.AddSeconds(10);
+        while (true)
+        {
+            try { return new FileStream(lockPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None); }
+            catch (IOException exception)
+            {
+                if (DateTime.UtcNow >= deadline) throw new TimeoutException($"Timed out acquiring worktree lock for task {taskId}.", exception);
+                Thread.Sleep(10);
+            }
+        }
+    }
+
+    private static bool BranchExists(string repository, string branch)
+    {
+        var start = new ProcessStartInfo("git") { WorkingDirectory = repository, UseShellExecute = false, RedirectStandardOutput = true };
+        start.ArgumentList.Add("show-ref"); start.ArgumentList.Add("--verify"); start.ArgumentList.Add("--quiet"); start.ArgumentList.Add("refs/heads/" + branch);
+        using var process = Process.Start(start) ?? throw new InvalidOperationException("Unable to inspect task branch.");
+        process.WaitForExit();
+        return process.ExitCode == 0;
     }
 
     private static bool IsContained(string candidate, string root)

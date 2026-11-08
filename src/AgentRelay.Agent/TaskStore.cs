@@ -20,11 +20,22 @@ public sealed class TaskStore
         UnmappedMemberHandling = JsonUnmappedMemberHandling.Disallow
     };
     private readonly string _directory;
+    private readonly TimeSpan _lockTimeout;
 
-    public TaskStore(string directory)
+    public TaskStore(string directory, TimeSpan? lockTimeout = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(directory);
         _directory = Path.GetFullPath(directory);
+        _lockTimeout = lockTimeout ?? TimeSpan.FromSeconds(10);
+        if (_lockTimeout <= TimeSpan.Zero) throw new ArgumentOutOfRangeException(nameof(lockTimeout));
+    }
+
+    public IDisposable AcquireSubmissionLease(string idempotencyKey)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(idempotencyKey);
+        Directory.CreateDirectory(_directory);
+        var keyHash = Hash(idempotencyKey);
+        return AcquireLock(keyHash + ".submit.lock", keyHash, "task submission");
     }
 
     public TaskSubmissionResult Submit(TaskRequest request)
@@ -195,12 +206,23 @@ public sealed class TaskStore
 
     private FileStream AcquireKeyLock(string keyHash)
     {
-        var lockPath = Path.Combine(_directory, $"{keyHash}.lock");
-        var deadline = DateTime.UtcNow.AddSeconds(10);
+        return AcquireLock(keyHash + ".lock", keyHash, "task record");
+    }
+
+    private FileStream AcquireLock(string fileName, string keyHash, string operation)
+    {
+        var lockPath = Path.Combine(_directory, fileName);
+        var deadline = DateTime.UtcNow + _lockTimeout;
         while (true)
         {
             try { return new FileStream(lockPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None); }
-            catch (IOException) when (DateTime.UtcNow < deadline) { Thread.Sleep(10); }
+            catch (IOException exception)
+            {
+                var remaining = deadline - DateTime.UtcNow;
+                if (remaining <= TimeSpan.Zero)
+                    throw new TimeoutException($"Timed out acquiring {operation} lock for key {keyHash[..12]}.", exception);
+                Thread.Sleep(remaining < TimeSpan.FromMilliseconds(10) ? remaining : TimeSpan.FromMilliseconds(10));
+            }
         }
     }
 
