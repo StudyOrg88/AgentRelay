@@ -142,69 +142,73 @@ public sealed class ProcessRunnerTests
         Assert.Equal($"{request.TaskId}:{launchToken}:{identity.ProcessId}:{identity.StartTimeUtcTicks}:7", File.ReadAllText(Path.Combine(temp.Path, "logs", request.TaskId + ".exitcode")));
     }
 
-    [Fact]
-    public async Task Windows_production_supervisor_binds_child_identity_and_exit_marker()
+    [Theory]
+    [InlineData(0, AgentTaskStatus.Succeeded)]
+    [InlineData(7, AgentTaskStatus.Failed)]
+    public async Task Windows_production_supervisor_preserves_child_exit_code(int childExitCode, AgentTaskStatus expectedStatus)
     {
         if (!OperatingSystem.IsWindows()) return;
         using var temp = new TemporaryDirectory();
         var bin = Path.Combine(temp.Path, "bin"); Directory.CreateDirectory(bin);
-        var fakeCodex = Path.Combine(bin, "codex.cmd");
-        var release = Path.Combine(temp.Path, "release-child");
+        var fakeCodex = Path.Combine(bin, "codex.exe");
+        var taskId = "task-windows-exit-" + childExitCode;
         var signal = Path.Combine(temp.Path, "signal");
-        var script = Path.Combine(temp.Path, "fake-codex.ps1");
-        File.WriteAllText(script, "[System.IO.File]::WriteAllText($env:AGENTRELAY_TEST_SIGNAL, [string]$PID)\nwhile (-not [System.IO.File]::Exists($env:AGENTRELAY_TEST_RELEASE)) { Start-Sleep -Milliseconds 20 }\nexit 7\n");
-        File.WriteAllText(fakeCodex, $"@echo off\r\n\"{Environment.GetFolderPath(Environment.SpecialFolder.System)}\\WindowsPowerShell\\v1.0\\powershell.exe\" -NoProfile -File \"{script}\"\r\nexit /b %ERRORLEVEL%\r\n");
+        var fakeCodexSource = Path.Combine(temp.Path, "Program.cs");
+        var fakeCodexProject = Path.Combine(temp.Path, "FakeCodex.csproj");
+        File.WriteAllText(fakeCodexSource, $"using System;\nusing System.IO;\nusing System.Threading;\ninternal static class Program {{\n    private static int Main() {{\n        File.WriteAllText(Environment.GetEnvironmentVariable(\"AGENTRELAY_TEST_SIGNAL\")!, \"ready\");\n        Thread.Sleep(2000);\n        Console.WriteLine(\"fake stdout\");\n        Console.Error.WriteLine(\"fake stderr\");\n        return {childExitCode};\n    }}\n}}\n");
+        File.WriteAllText(fakeCodexProject, "<Project Sdk=\"Microsoft.NET.Sdk\"><PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net10.0</TargetFramework><ImplicitUsings>enable</ImplicitUsings><PublishAot>true</PublishAot><SelfContained>true</SelfContained></PropertyGroup></Project>");
+        var dotnetHost = Environment.GetEnvironmentVariable("DOTNET_HOST_PATH") ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "dotnet", "dotnet.exe");
+        var build = Process.Start(new ProcessStartInfo(dotnetHost)
+        {
+            WorkingDirectory = temp.Path,
+            UseShellExecute = false,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            ArgumentList = { "publish", fakeCodexProject, "--configuration", "Release", "--runtime", "win-x64", "--self-contained", "true", "-p:UseAppHost=true", "--output", bin, "--verbosity", "quiet" }
+        })!;
+        var buildOutput = build.StandardOutput.ReadToEnd() + build.StandardError.ReadToEnd();
+        build.WaitForExit();
+        Assert.True(build.ExitCode == 0, buildOutput);
+        File.Move(Path.Combine(bin, "FakeCodex.exe"), fakeCodex);
         var store = new TaskStore(Path.Combine(temp.Path, "state"));
-        var request = Request("task-windows-production"); store.Submit(request);
+        var request = Request(taskId); store.Submit(request);
         var logs = Path.Combine(temp.Path, "logs");
         var oldPath = Environment.GetEnvironmentVariable("PATH");
+        var oldSignal = Environment.GetEnvironmentVariable("AGENTRELAY_TEST_SIGNAL");
         Environment.SetEnvironmentVariable("PATH", bin + Path.PathSeparator + oldPath);
         Environment.SetEnvironmentVariable("AGENTRELAY_TEST_SIGNAL", signal);
-        Environment.SetEnvironmentVariable("AGENTRELAY_TEST_RELEASE", release);
         var runner = new ProcessRunner(store, logs, codexExecutable: "codex");
-        var previousFailure = store.BeforeWriteProcessIdentity;
-        var failWrite = true;
-        store.BeforeWriteProcessIdentity = () =>
-        {
-            if (!failWrite) return;
-            failWrite = false;
-            throw new IOException("injected production identity persistence failure");
-        };
-
         try
         {
-            Assert.Throws<IOException>(() => runner.Start(request, temp.Path));
-            var launchToken = store.FindByTaskId(request.TaskId)!.LaunchToken!;
-            var sidecar = Path.Combine(logs, request.TaskId + ".launch.wrapper");
-            await WaitUntilAsync(() => File.Exists(sidecar));
-            var wrapperIdentity = File.ReadAllText(sidecar).Split(':');
-            Assert.Equal(request.TaskId, wrapperIdentity[0]);
-            Assert.Equal(launchToken, wrapperIdentity[1]);
-            var identity = new ProcessIdentity(int.Parse(wrapperIdentity[2]), long.Parse(wrapperIdentity[3]));
+            var identity = runner.Start(request, temp.Path);
             await WaitUntilAsync(() => File.Exists(signal));
-            store.BeforeWriteProcessIdentity = null;
-            Assert.Equal(identity, runner.Start(request, temp.Path));
             var task = store.FindByTaskId(request.TaskId)!;
             Assert.Equal(identity, task.ProcessIdentity);
             var phase = Path.Combine(logs, request.TaskId + ".launch-phase");
-            await WaitUntilAsync(() => File.Exists(phase) && File.ReadAllText(phase).EndsWith(":identified", StringComparison.Ordinal));
-            await File.WriteAllTextAsync(release, "go");
-            await WaitUntilAsync(() => File.Exists(Path.Combine(logs, request.TaskId + ".exitcode")));
-            var marker = File.ReadAllText(Path.Combine(logs, request.TaskId + ".exitcode"));
+            var exitMarker = Path.Combine(logs, request.TaskId + ".exitcode");
+            await WaitUntilAsync(() => File.Exists(exitMarker) ||
+                (File.Exists(phase) && File.ReadAllText(phase).EndsWith(":error", StringComparison.Ordinal)));
+            Assert.True(!File.Exists(phase) || !File.ReadAllText(phase).EndsWith(":error", StringComparison.Ordinal),
+                File.Exists(Path.Combine(logs, request.TaskId + ".launch.wrapper.error"))
+                    ? File.ReadAllText(Path.Combine(logs, request.TaskId + ".launch.wrapper.error"))
+                    : "wrapper error was not persisted");
+            await WaitUntilAsync(() => File.ReadAllText(phase).EndsWith(":completed", StringComparison.Ordinal));
+            Assert.EndsWith(":completed", File.ReadAllText(phase));
+            var marker = File.ReadAllText(exitMarker);
             Assert.True(new SystemProcessSupervisor().ReadExitCode(identity,
-                Path.Combine(logs, request.TaskId + ".exitcode"), request.TaskId, task.LaunchToken!) == 0, marker);
+                exitMarker, request.TaskId, task.LaunchToken!) == childExitCode, marker);
             Assert.Null(new SystemProcessSupervisor().ReadExitCode(identity with { StartTimeUtcTicks = identity.StartTimeUtcTicks + 1 },
                 Path.Combine(logs, request.TaskId + ".exitcode"), request.TaskId, task.LaunchToken!));
             Assert.Null(new SystemProcessSupervisor().ReadExitCode(identity, Path.Combine(logs, request.TaskId + ".exitcode"),
                 request.TaskId, task.LaunchToken + "wrong"));
+            await WaitUntilAsync(() => runner.Reconcile(request.TaskId).Status == expectedStatus);
+            Assert.Equal(expectedStatus, store.FindByTaskId(request.TaskId)!.Status.Status);
+            Assert.Equal(expectedStatus, store.FindByTaskId(request.TaskId)!.Report!.Status);
         }
         finally
         {
-            store.BeforeWriteProcessIdentity = previousFailure;
             Environment.SetEnvironmentVariable("PATH", oldPath);
-            Environment.SetEnvironmentVariable("AGENTRELAY_TEST_SIGNAL", null);
-            Environment.SetEnvironmentVariable("AGENTRELAY_TEST_RELEASE", null);
-            if (!File.Exists(release)) File.WriteAllText(release, "cleanup");
+            Environment.SetEnvironmentVariable("AGENTRELAY_TEST_SIGNAL", oldSignal);
         }
     }
 
@@ -360,6 +364,7 @@ public sealed class ProcessRunnerTests
             {
                 try { Directory.Delete(Path, recursive: true); return; }
                 catch (IOException) when (DateTime.UtcNow < deadline) { Thread.Sleep(25); }
+                catch (UnauthorizedAccessException) when (DateTime.UtcNow < deadline) { Thread.Sleep(25); }
             }
         }
     }

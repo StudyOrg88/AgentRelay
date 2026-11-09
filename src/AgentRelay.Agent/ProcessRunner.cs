@@ -253,7 +253,62 @@ public sealed class ProcessRunner
         if (OperatingSystem.IsWindows())
         {
             var childIdentityPath = LaunchIdentityPath(request.TaskId) + ".wrapper";
-            File.WriteAllText(scriptPath, "$ErrorActionPreference='Stop'; $phase=$env:AGENTRELAY_PHASE; function Write-Phase($value) { $tmp=$phase+'.tmp'; [System.IO.File]::WriteAllText($tmp, \"$env:AGENTRELAY_TASK`:$env:AGENTRELAY_TOKEN`:$value\"); Move-Item -Force $tmp $phase }; try { Write-Phase 'starting'; $p=Start-Process -FilePath $env:AGENTRELAY_CODEX -ArgumentList @('exec','--json','-') -WorkingDirectory $env:AGENTRELAY_WORKDIR -RedirectStandardInput $env:AGENTRELAY_INPUT -RedirectStandardOutput $env:AGENTRELAY_OUT -RedirectStandardError $env:AGENTRELAY_ERR -PassThru; $ticks=$p.StartTime.ToUniversalTime().Ticks; $identity=\"$env:AGENTRELAY_TASK`:$env:AGENTRELAY_TOKEN`:$($p.Id)`:$ticks\"; $tmp=$env:AGENTRELAY_IDENTITY+'.tmp'; [System.IO.File]::WriteAllText($tmp,$identity); Move-Item -Force $tmp $env:AGENTRELAY_IDENTITY; Write-Phase 'identified'; $p.WaitForExit(); $p.Refresh(); $exitCode=[int]$p.ExitCode; if ($p.Id -ne [int]($identity.Split(':')[2]) -or $p.StartTime.ToUniversalTime().Ticks -ne [long]($identity.Split(':')[3])) { throw 'Child identity changed before exit marker.' }; foreach($line in (Get-Content $env:AGENTRELAY_OUT) + (Get-Content $env:AGENTRELAY_ERR)) { $line -replace '(?i)(token|password|secret|authorization)(\\s*[:=]\\s*)[^\\s,;]+', '$1$2[redacted]' | Add-Content $env:AGENTRELAY_LOG }; $tmp=$env:AGENTRELAY_EXIT+'.tmp'; [System.IO.File]::WriteAllText($tmp, \"$env:AGENTRELAY_TASK`:$env:AGENTRELAY_TOKEN`:$($p.Id)`:$ticks`:$exitCode\"); Move-Item -Force $tmp $env:AGENTRELAY_EXIT; Write-Phase 'completed'; Remove-Item -Force $env:AGENTRELAY_INPUT } catch { $_.ToString() | Set-Content -NoNewline ($env:AGENTRELAY_IDENTITY+'.error'); Write-Phase 'error'; exit 1 }");
+            var windowsSupervisor = """
+                $ErrorActionPreference = 'Stop'
+                $phase = $env:AGENTRELAY_PHASE
+                function Write-Phase($value) {
+                    $temporary = $phase + '.tmp'
+                    [System.IO.File]::WriteAllText($temporary, "$env:AGENTRELAY_TASK`:$env:AGENTRELAY_TOKEN`:$value")
+                    Move-Item -Force $temporary $phase
+                }
+                try {
+                    Write-Phase 'starting'
+                    $inputBytes = [System.IO.File]::ReadAllBytes($env:AGENTRELAY_INPUT)
+                    $start = [System.Diagnostics.ProcessStartInfo]::new()
+                    $start.FileName = $env:AGENTRELAY_CODEX
+                    $start.WorkingDirectory = $env:AGENTRELAY_WORKDIR
+                    $start.UseShellExecute = $false
+                    $start.CreateNoWindow = $true
+                    $start.RedirectStandardInput = $true
+                    $start.RedirectStandardOutput = $true
+                    $start.RedirectStandardError = $true
+                    $start.Arguments = 'exec --json -'
+                    $child = [System.Diagnostics.Process]::new()
+                    $child.StartInfo = $start
+                    if (-not $child.Start()) { throw 'Unable to start Codex child process.' }
+                    $ticks = $child.StartTime.ToUniversalTime().Ticks
+                    $identity = "$env:AGENTRELAY_TASK`:$env:AGENTRELAY_TOKEN`:$($child.Id)`:$ticks"
+                    $temporary = $env:AGENTRELAY_IDENTITY + '.tmp'
+                    [System.IO.File]::WriteAllText($temporary, $identity)
+                    Move-Item -Force $temporary $env:AGENTRELAY_IDENTITY
+                    Write-Phase 'identified'
+                    $stdout = [System.IO.FileStream]::new($env:AGENTRELAY_OUT, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::ReadWrite)
+                    $stderr = [System.IO.FileStream]::new($env:AGENTRELAY_ERR, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::ReadWrite)
+                    $stdoutCopy = $child.StandardOutput.BaseStream.CopyToAsync($stdout)
+                    $stderrCopy = $child.StandardError.BaseStream.CopyToAsync($stderr)
+                    try { $child.StandardInput.BaseStream.Write($inputBytes, 0, $inputBytes.Length) } finally { $child.StandardInput.Close() }
+                    $child.WaitForExit()
+                    [System.Threading.Tasks.Task]::WaitAll(@($stdoutCopy, $stderrCopy))
+                    $stdout.Dispose(); $stderr.Dispose()
+                    $child.Refresh()
+                    $exitCode = $child.ExitCode
+                    if ($child.Id -ne [int]($identity.Split(':')[2]) -or $child.StartTime.ToUniversalTime().Ticks -ne [long]($identity.Split(':')[3])) { throw 'Child identity changed before exit marker.' }
+                    foreach ($line in (Get-Content $env:AGENTRELAY_OUT) + (Get-Content $env:AGENTRELAY_ERR)) {
+                        $line -replace '(?i)(token|password|secret|authorization)(\s*[:=]\s*)[^\s,;]+', '$1$2[redacted]' | Add-Content $env:AGENTRELAY_LOG
+                    }
+                    $temporary = $env:AGENTRELAY_EXIT + '.tmp'
+                    [System.IO.File]::WriteAllText($temporary, "$env:AGENTRELAY_TASK`:$env:AGENTRELAY_TOKEN`:$($child.Id)`:$ticks`:$exitCode")
+                    Move-Item -Force $temporary $env:AGENTRELAY_EXIT
+                    [System.IO.File]::Delete($env:AGENTRELAY_INPUT)
+                    $child.Dispose()
+                    Write-Phase 'completed'
+                } catch {
+                    $_.ToString() | Set-Content -NoNewline ($env:AGENTRELAY_IDENTITY + '.error')
+                    Write-Phase 'error'
+                    exit 1
+                }
+                """;
+            File.WriteAllText(scriptPath, windowsSupervisor);
             var start = new ProcessStartInfo("powershell.exe") { UseShellExecute = false, CreateNoWindow = true, RedirectStandardError = true, RedirectStandardOutput = true, WorkingDirectory = workingDirectory };
             start.ArgumentList.Add("-NoProfile"); start.ArgumentList.Add("-NonInteractive"); start.ArgumentList.Add("-ExecutionPolicy"); start.ArgumentList.Add("Bypass"); start.ArgumentList.Add("-File"); start.ArgumentList.Add(scriptPath);
             start.Environment["AGENTRELAY_CODEX"] = codexExecutable;
