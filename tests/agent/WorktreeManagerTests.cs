@@ -122,6 +122,24 @@ public sealed class WorktreeManagerTests
         Assert.True(File.Exists(Path.Combine(repo, ".git", "agentrelay-worktree-locks", "root.lock")));
     }
 
+    [Fact]
+    public async Task Different_worktree_checkouts_resolve_to_same_common_lock_target()
+    {
+        using var temp = new TemporaryDirectory();
+        var source = temp.CreateGitRepository("source");
+        var linked = Path.Combine(temp.Path, "linked");
+        var add = new System.Diagnostics.ProcessStartInfo("git") { WorkingDirectory = source, UseShellExecute = false };
+        add.ArgumentList.Add("worktree"); add.ArgumentList.Add("add"); add.ArgumentList.Add("--detach"); add.ArgumentList.Add(linked); add.ArgumentList.Add("HEAD");
+        using (var p = System.Diagnostics.Process.Start(add)!) { p.WaitForExit(); Assert.Equal(0, p.ExitCode); }
+        var manager = new WorktreeManager([source, linked]);
+
+        await manager.CreateAsync(Request(source));
+        await manager.CreateAsync(Request(linked) with { TaskId = "task-linked", IdempotencyKey = "key-linked", Workspace = Path.Combine(linked, ".agentrelay-worktrees", "task-linked"), Branch = "task/linked" });
+
+        Assert.True(File.Exists(Path.Combine(source, ".git", "agentrelay-worktree-locks", "root.lock")));
+        Assert.False(Directory.Exists(Path.Combine(linked, ".git", "agentrelay-worktree-locks")));
+    }
+
     private static TaskRequest Request(string repo) => new(TaskContract.SchemaVersion, "task-one", "key-one",
         "https://github.com/acme/repo/issues/1", AgentRelayRole.Worker, "device-a", repo,
         Path.Combine(repo, ".agentrelay-worktrees", "task-one"), "task/one", 1);

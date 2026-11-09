@@ -46,26 +46,43 @@ public sealed class WorktreeManager
         return actual;
     }
 
-    public async Task<string> CreateAsync(TaskRequest request, CancellationToken cancellationToken = default)
+    public Task<string> CreateAsync(TaskRequest request, CancellationToken cancellationToken = default) =>
+        WithWorktreeRootLeaseAsync(request, createIfMissing: false, cancellationToken);
+
+    public Task<string> CreateOrValidateAsync(TaskRequest request, CancellationToken cancellationToken = default) =>
+        WithWorktreeRootLeaseAsync(request, createIfMissing: true, cancellationToken);
+
+    private async Task<string> WithWorktreeRootLeaseAsync(TaskRequest request, bool createIfMissing, CancellationToken cancellationToken)
     {
         var repository = ValidateRepository(request.Repository);
         var workspaceRoot = Path.Combine(repository, ".agentrelay-worktrees");
-        if (Directory.Exists(workspaceRoot) && (File.GetAttributes(workspaceRoot) & FileAttributes.ReparsePoint) != 0)
-            throw new InvalidOperationException("Worktree root cannot be a symbolic link or junction.");
-        Directory.CreateDirectory(workspaceRoot);
         var gitDirectory = GetCommonGitDirectory(repository);
         var lockDirectory = Path.Combine(gitDirectory, "agentrelay-worktree-locks");
         Directory.CreateDirectory(lockDirectory);
-        if ((File.GetAttributes(gitDirectory) & FileAttributes.ReparsePoint) != 0 ||
-            (File.GetAttributes(lockDirectory) & FileAttributes.ReparsePoint) != 0)
-            throw new InvalidOperationException("Git metadata or worktree lock directory cannot be a symbolic link or junction.");
+        ValidateLockTargets(gitDirectory, lockDirectory);
         var lockPath = Path.Combine(lockDirectory, "root.lock");
-        if (File.Exists(lockPath) && (File.GetAttributes(lockPath) & FileAttributes.ReparsePoint) != 0)
-            throw new InvalidOperationException("Worktree root lock cannot be a symbolic link or junction.");
         using var lease = AcquireWorkspaceLock(lockPath, "worktree root");
         repository = ValidateRepository(request.Repository);
+        var lockedGitDirectory = GetCommonGitDirectory(repository);
+        var lockedLockDirectory = Path.Combine(lockedGitDirectory, "agentrelay-worktree-locks");
+        if (!SamePath(gitDirectory, lockedGitDirectory) || !SamePath(lockDirectory, lockedLockDirectory))
+            throw new InvalidOperationException("Git common directory changed while acquiring the worktree lock.");
+        ValidateLockTargets(lockedGitDirectory, lockedLockDirectory);
+        if (File.GetAttributes(lockPath).HasFlag(FileAttributes.ReparsePoint))
+            throw new InvalidOperationException("Worktree root lock cannot be a symbolic link or junction.");
+        if (!Directory.Exists(workspaceRoot)) Directory.CreateDirectory(workspaceRoot);
         ValidateWorkspaceRoot(workspaceRoot);
         var workspace = ValidateWorkspace(request);
+        if (Directory.Exists(workspace))
+        {
+            if (!createIfMissing) throw new InvalidOperationException("Task workspace already exists.");
+            var resolved = ResolveExistingPath(workspace);
+            if (!SamePath(resolved, workspace) || !File.Exists(Path.Combine(workspace, ".git")))
+                throw new InvalidOperationException("Existing task workspace is not the registered Git worktree.");
+            return workspace;
+        }
+        if (!createIfMissing && (File.Exists(workspace) || Directory.Exists(workspace)))
+            throw new InvalidOperationException("Task workspace already exists.");
         Directory.CreateDirectory(Path.GetDirectoryName(workspace)!);
         if (Directory.Exists(workspace) || File.Exists(workspace)) throw new InvalidOperationException("Task workspace already exists.");
         if (BranchExists(repository, request.Branch)) throw new InvalidOperationException("Task branch already exists.");
@@ -101,18 +118,14 @@ public sealed class WorktreeManager
         return workspace;
     }
 
-    public Task<string> CreateOrValidateAsync(TaskRequest request, CancellationToken cancellationToken = default)
+    private static void ValidateLockTargets(string gitDirectory, string lockDirectory)
     {
-        var repository = ValidateRepository(request.Repository);
-        var workspace = ValidateWorkspace(request);
-        if (Directory.Exists(workspace))
-        {
-            var resolved = ResolveExistingPath(workspace);
-            if (!SamePath(resolved, workspace) || !File.Exists(Path.Combine(workspace, ".git")))
-                throw new InvalidOperationException("Existing task workspace is not the registered Git worktree.");
-            return Task.FromResult(workspace);
-        }
-        return CreateAsync(request, cancellationToken);
+        if (!Directory.Exists(gitDirectory) || !Directory.Exists(lockDirectory) ||
+            File.GetAttributes(gitDirectory).HasFlag(FileAttributes.ReparsePoint) ||
+            File.GetAttributes(lockDirectory).HasFlag(FileAttributes.ReparsePoint))
+            throw new InvalidOperationException("Git metadata or worktree lock directory is missing or linked.");
+        RejectReparsePointAncestors(gitDirectory);
+        RejectReparsePointAncestors(lockDirectory);
     }
 
     private static void ValidateWorkspaceRoot(string root)
