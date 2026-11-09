@@ -147,24 +147,85 @@ public sealed class ProcessRunnerTests
     {
         if (!OperatingSystem.IsWindows()) return;
         using var temp = new TemporaryDirectory();
-        var where = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), "where.exe");
-        Assert.True(File.Exists(where));
+        var bin = Path.Combine(temp.Path, "bin"); Directory.CreateDirectory(bin);
+        var fakeCodex = Path.Combine(bin, "codex.cmd");
+        var release = Path.Combine(temp.Path, "release-child");
+        var signal = Path.Combine(temp.Path, "signal");
+        var script = Path.Combine(temp.Path, "fake-codex.ps1");
+        File.WriteAllText(script, "[System.IO.File]::WriteAllText($env:AGENTRELAY_TEST_SIGNAL, [string]$PID)\nwhile (-not [System.IO.File]::Exists($env:AGENTRELAY_TEST_RELEASE)) { Start-Sleep -Milliseconds 20 }\nexit 7\n");
+        File.WriteAllText(fakeCodex, $"@echo off\r\n\"{Environment.GetFolderPath(Environment.SpecialFolder.System)}\\WindowsPowerShell\\v1.0\\powershell.exe\" -NoProfile -File \"{script}\"\r\nexit /b %ERRORLEVEL%\r\n");
         var store = new TaskStore(Path.Combine(temp.Path, "state"));
         var request = Request("task-windows-production"); store.Submit(request);
         var logs = Path.Combine(temp.Path, "logs");
-        var runner = new ProcessRunner(store, logs, codexExecutable: "where");
+        var oldPath = Environment.GetEnvironmentVariable("PATH");
+        Environment.SetEnvironmentVariable("PATH", bin + Path.PathSeparator + oldPath);
+        Environment.SetEnvironmentVariable("AGENTRELAY_TEST_SIGNAL", signal);
+        Environment.SetEnvironmentVariable("AGENTRELAY_TEST_RELEASE", release);
+        var runner = new ProcessRunner(store, logs, codexExecutable: "codex");
+        var previousFailure = store.BeforeWriteProcessIdentity;
+        var failWrite = true;
+        store.BeforeWriteProcessIdentity = () =>
+        {
+            if (!failWrite) return;
+            failWrite = false;
+            throw new IOException("injected production identity persistence failure");
+        };
 
-        var identity = runner.Start(request, temp.Path);
-        var task = store.FindByTaskId(request.TaskId)!;
-        Assert.Equal(identity, task.ProcessIdentity);
-        await WaitUntilAsync(() => File.Exists(Path.Combine(logs, request.TaskId + ".exitcode")));
-        var marker = File.ReadAllText(Path.Combine(logs, request.TaskId + ".exitcode"));
-        Assert.True(new SystemProcessSupervisor().ReadExitCode(identity,
-            Path.Combine(logs, request.TaskId + ".exitcode"), request.TaskId, task.LaunchToken!) == 0, marker);
-        Assert.Null(new SystemProcessSupervisor().ReadExitCode(identity with { StartTimeUtcTicks = identity.StartTimeUtcTicks + 1 },
-            Path.Combine(logs, request.TaskId + ".exitcode"), request.TaskId, task.LaunchToken!));
-        Assert.Null(new SystemProcessSupervisor().ReadExitCode(identity, Path.Combine(logs, request.TaskId + ".exitcode"),
-            request.TaskId, task.LaunchToken + "wrong"));
+        try
+        {
+            Assert.Throws<IOException>(() => runner.Start(request, temp.Path));
+            var launchToken = store.FindByTaskId(request.TaskId)!.LaunchToken!;
+            var sidecar = Path.Combine(logs, request.TaskId + ".launch.wrapper");
+            await WaitUntilAsync(() => File.Exists(sidecar));
+            var wrapperIdentity = File.ReadAllText(sidecar).Split(':');
+            Assert.Equal(request.TaskId, wrapperIdentity[0]);
+            Assert.Equal(launchToken, wrapperIdentity[1]);
+            var identity = new ProcessIdentity(int.Parse(wrapperIdentity[2]), long.Parse(wrapperIdentity[3]));
+            await WaitUntilAsync(() => File.Exists(signal));
+            store.BeforeWriteProcessIdentity = null;
+            Assert.Equal(identity, runner.Start(request, temp.Path));
+            var task = store.FindByTaskId(request.TaskId)!;
+            Assert.Equal(identity, task.ProcessIdentity);
+            var phase = Path.Combine(logs, request.TaskId + ".launch-phase");
+            await WaitUntilAsync(() => File.Exists(phase) && File.ReadAllText(phase).EndsWith(":identified", StringComparison.Ordinal));
+            await File.WriteAllTextAsync(release, "go");
+            await WaitUntilAsync(() => File.Exists(Path.Combine(logs, request.TaskId + ".exitcode")));
+            var marker = File.ReadAllText(Path.Combine(logs, request.TaskId + ".exitcode"));
+            Assert.True(new SystemProcessSupervisor().ReadExitCode(identity,
+                Path.Combine(logs, request.TaskId + ".exitcode"), request.TaskId, task.LaunchToken!) == 0, marker);
+            Assert.Null(new SystemProcessSupervisor().ReadExitCode(identity with { StartTimeUtcTicks = identity.StartTimeUtcTicks + 1 },
+                Path.Combine(logs, request.TaskId + ".exitcode"), request.TaskId, task.LaunchToken!));
+            Assert.Null(new SystemProcessSupervisor().ReadExitCode(identity, Path.Combine(logs, request.TaskId + ".exitcode"),
+                request.TaskId, task.LaunchToken + "wrong"));
+        }
+        finally
+        {
+            store.BeforeWriteProcessIdentity = previousFailure;
+            Environment.SetEnvironmentVariable("PATH", oldPath);
+            Environment.SetEnvironmentVariable("AGENTRELAY_TEST_SIGNAL", null);
+            Environment.SetEnvironmentVariable("AGENTRELAY_TEST_RELEASE", null);
+            if (!File.Exists(release)) File.WriteAllText(release, "cleanup");
+        }
+    }
+
+    [Fact]
+    public void Windows_partial_launch_phase_without_identity_is_diagnosable_and_does_not_relaunch()
+    {
+        if (!OperatingSystem.IsWindows()) return;
+        using var temp = new TemporaryDirectory();
+        var store = new TaskStore(Path.Combine(temp.Path, "state"));
+        var request = Request("task-partial-wrapper"); store.Submit(request);
+        store.WriteStatus(Running(request) with { Status = AgentTaskStatus.Starting });
+        var token = store.WriteLaunchToken(request.TaskId);
+        var logs = Path.Combine(temp.Path, "logs"); Directory.CreateDirectory(logs);
+        File.WriteAllText(Path.Combine(logs, request.TaskId + ".launch-phase"), $"{request.TaskId}:{token}:starting");
+        var launcher = new CountingLauncher();
+        var runner = new ProcessRunner(store, logs, launcher: launcher);
+
+        var exception = Assert.Throws<InvalidOperationException>(() => runner.Start(request, temp.Path));
+
+        Assert.Contains("phase 'starting'", exception.Message);
+        Assert.Equal(0, launcher.StartCount);
     }
 
     [Fact]
@@ -186,6 +247,26 @@ public sealed class ProcessRunnerTests
     }
 
     [Fact]
+    public void Reconcile_rejects_exit_marker_when_store_identity_differs_from_launch_sidecar()
+    {
+        using var temp = new TemporaryDirectory();
+        var store = new TaskStore(Path.Combine(temp.Path, "state"));
+        var request = Request("task-identity-mismatch"); store.Submit(request);
+        store.WriteStatus(Running(request));
+        var token = store.WriteLaunchToken(request.TaskId);
+        store.WriteProcessIdentity(request.TaskId, new ProcessIdentity(444, 555));
+        var logs = Path.Combine(temp.Path, "logs"); Directory.CreateDirectory(logs);
+        File.WriteAllText(Path.Combine(logs, request.TaskId + ".launch"), $"{request.TaskId}:{token}:444:556");
+        File.WriteAllText(Path.Combine(logs, request.TaskId + ".exitcode"), $"{request.TaskId}:{token}:444:555:0");
+        var runner = new ProcessRunner(store, logs, new FakeSupervisor { Alive = false });
+
+        var result = runner.Reconcile(request.TaskId);
+
+        Assert.Equal(AgentTaskStatus.Running, result.Status);
+        Assert.Null(store.FindByTaskId(request.TaskId)!.Report);
+    }
+
+    [Fact]
     public void Fresh_agent_reconciles_exited_task_from_persisted_identity_and_exit_code()
     {
         using var temp = new TemporaryDirectory();
@@ -198,6 +279,7 @@ public sealed class ProcessRunnerTests
         Directory.CreateDirectory(logs);
         var launchToken = store.WriteLaunchToken(request.TaskId);
         store.WriteProcessIdentity(request.TaskId, new ProcessIdentity(321, 777));
+        File.WriteAllText(Path.Combine(logs, request.TaskId + ".launch"), $"{request.TaskId}:{launchToken}:321:777");
         File.WriteAllText(Path.Combine(logs, request.TaskId + ".exitcode"), $"{request.TaskId}:{launchToken}:321:777:0");
         var runner = new ProcessRunner(new TaskStore(stateDir), logs, new FakeSupervisor { Alive = false });
 
@@ -255,6 +337,15 @@ public sealed class ProcessRunnerTests
             }
             var process = Process.Start(start)!;
             return new ChildProcess(process, process.StandardInput);
+        }
+    }
+    private sealed class CountingLauncher : IChildProcessLauncher
+    {
+        public int StartCount { get; private set; }
+        public ChildProcess Start(ProcessStartInfo startInfo)
+        {
+            StartCount++;
+            throw new InvalidOperationException("Unexpected launcher invocation.");
         }
     }
     private sealed class TemporaryDirectory : IDisposable

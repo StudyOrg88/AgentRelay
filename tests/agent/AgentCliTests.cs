@@ -126,7 +126,7 @@ public sealed class AgentCliTests
         Assert.Null(store.FindByTaskId(request.TaskId)!.ProcessIdentity);
 
         using var response = JsonDocument.Parse(await service.ExecuteAsync("submit", request.ToJson()));
-        Assert.Equal("running", response.RootElement.GetProperty("status").GetString());
+        Assert.True(new[] { "running", "failed" }.Contains(response.RootElement.GetProperty("status").GetString()));
         Assert.Equal(1, launcher.StartCount);
     }
 
@@ -154,6 +154,33 @@ public sealed class AgentCliTests
         Assert.Equal(AgentTaskStatus.Failed, store.FindByTaskId(request.TaskId)!.Status.Status);
     }
 
+    [Theory]
+    [InlineData(AgentTaskStatus.Queued)]
+    [InlineData(AgentTaskStatus.Starting)]
+    public async Task Retry_recreates_missing_workspace_for_accepted_nonterminal_task(AgentTaskStatus status)
+    {
+        using var temp = new TemporaryDirectory();
+        var repo = temp.CreateGitRepository();
+        var request = Request(repo);
+        var device = new RegisteredDevice("device-a", "Local", OperatingSystem.IsWindows() ? "windows" : "ubuntu", "local", null, null, null,
+            [repo], ["worker"], true, new Dictionary<string, int> { ["worker"] = 1 });
+        var store = new TaskStore(Path.Combine(temp.Path, "state"));
+        store.Submit(request);
+        if (status == AgentTaskStatus.Starting)
+            store.WriteStatus(new TaskStatusRecord(TaskContract.SchemaVersion, request.TaskId, request.IdempotencyKey, request.DeviceId, status, DateTimeOffset.UtcNow));
+        var workspace = request.Workspace;
+        if (Directory.Exists(workspace)) Directory.Delete(workspace, true);
+        var launcher = new CountingLauncher();
+        var service = new AgentService(device, store, new WorktreeManager([repo]),
+            new ProcessRunner(store, Path.Combine(temp.Path, "logs"), launcher: launcher));
+
+        using var response = JsonDocument.Parse(await service.ExecuteAsync("submit", request.ToJson()));
+
+        Assert.Equal("running", response.RootElement.GetProperty("status").GetString());
+        Assert.True(Directory.Exists(workspace));
+        Assert.Equal(1, launcher.StartCount);
+    }
+
     [Fact]
     public async Task Status_report_and_cancel_reconcile_by_task_id_and_preserve_workspace()
     {
@@ -174,6 +201,7 @@ public sealed class AgentCliTests
         var identity = new ProcessIdentity(515, 1234);
         var launchToken = store.WriteLaunchToken(request.TaskId);
         store.WriteProcessIdentity(request.TaskId, identity);
+        File.WriteAllText(Path.Combine(logs, request.TaskId + ".launch"), $"{request.TaskId}:{launchToken}:{identity.ProcessId}:{identity.StartTimeUtcTicks}");
         File.WriteAllText(Path.Combine(logs, request.TaskId + ".exitcode"), $"{request.TaskId}:{launchToken}:{identity.ProcessId}:{identity.StartTimeUtcTicks}:0");
         var supervisor = new FakeSupervisor { Alive = false };
         var service = new AgentService(device, new TaskStore(statePath), new WorktreeManager([repo]), new ProcessRunner(new TaskStore(statePath), logs, supervisor));

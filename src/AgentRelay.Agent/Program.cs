@@ -61,8 +61,6 @@ public sealed class AgentService
 
         if (!_device.Repositories.Any(path => SamePath(path, request.Repository)))
             throw new InvalidOperationException("Task identity, role, or repository is not approved.");
-        var workspace = _worktrees.ValidateWorkspace(request);
-
         var accepted = _store.Submit(request);
         if (accepted.Disposition == TaskSubmissionDisposition.Conflict) throw new InvalidOperationException("Idempotency key conflict.");
         if (accepted.Disposition != TaskSubmissionDisposition.Accepted)
@@ -70,18 +68,18 @@ public sealed class AgentService
             _ = _runner.Reconcile(accepted.TaskId);
             return _store.FindByTaskId(accepted.TaskId)!.Status;
         }
-        await ResumeOrStartAsync(request, workspace, cancellationToken).ConfigureAwait(false);
+        await ResumeOrStartAsync(request, null, cancellationToken).ConfigureAwait(false);
         return _store.FindByTaskId(request.TaskId)!.Status;
     }
 
     private async Task<TaskStatusRecord> ResumeOrReturnAsync(StoredTaskRecord record, CancellationToken cancellationToken)
     {
         if (record.Status.Status is AgentTaskStatus.Queued or AgentTaskStatus.Starting)
-            return await ResumeOrStartAsync(record.Request, _worktrees.ValidateWorkspace(record.Request), cancellationToken).ConfigureAwait(false);
+            return await ResumeOrStartAsync(record.Request, null, cancellationToken).ConfigureAwait(false);
         return _runner.Reconcile(record.Request.TaskId);
     }
 
-    private async Task<TaskStatusRecord> ResumeOrStartAsync(TaskRequest request, string workspace, CancellationToken cancellationToken)
+    private async Task<TaskStatusRecord> ResumeOrStartAsync(TaskRequest request, string? workspace, CancellationToken cancellationToken)
     {
         var record = _store.FindByTaskId(request.TaskId)!;
         if (record.ProcessIdentity is not null)
@@ -101,7 +99,7 @@ public sealed class AgentService
         if (record.Status.Status == AgentTaskStatus.Queued)
             _store.WriteStatus(record.Status with { Status = AgentTaskStatus.Starting, UpdatedAt = DateTimeOffset.UtcNow });
         var actualWorkspace = await _worktrees.CreateOrValidateAsync(request, cancellationToken).ConfigureAwait(false);
-        if (!SamePath(workspace, actualWorkspace)) throw new InvalidOperationException("Created worktree path did not match the task identity.");
+        if (workspace is not null && !SamePath(workspace, actualWorkspace)) throw new InvalidOperationException("Created worktree path did not match the task identity.");
         _runner.Start(request, actualWorkspace, _launcher);
         return _store.FindByTaskId(request.TaskId)!.Status;
     }
