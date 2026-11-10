@@ -155,6 +155,45 @@ public sealed class DeviceTransportTests
         finally { File.Delete(pidFile); }
     }
 
+    [Fact]
+    public async Task AcceptsValidJsonAtExactUtf8ByteLimit()
+    {
+        const string json = "{\"value\":\"ééééé\"}";
+        var limit = System.Text.Encoding.UTF8.GetByteCount(json);
+        var result = await new DeviceTransport.SystemProcessInvoker(limit, 64)
+            .InvokeAsync(OutputTextInvocation(json, "stdout"), CancellationToken.None);
+
+        Assert.Equal(json, result.StandardOutput);
+        using var parsed = System.Text.Json.JsonDocument.Parse(result.StandardOutput);
+        Assert.Equal("ééééé", parsed.RootElement.GetProperty("value").GetString());
+    }
+
+    [Fact]
+    public async Task OneByteOverTheExactLimitFailsAsOutputLimit()
+    {
+        const string json = "{\"value\":\"ééééé\"}";
+        var limit = System.Text.Encoding.UTF8.GetByteCount(json);
+        var exception = await Assert.ThrowsAsync<DeviceTransportException>(() =>
+            new DeviceTransport.SystemProcessInvoker(limit, 64)
+                .InvokeAsync(OutputTextInvocation(json + " ", "stdout"), CancellationToken.None));
+
+        Assert.Contains("output exceeded", exception.Message);
+        Assert.Equal(limit + 1, exception.OutputBytesRead);
+    }
+
+    [Fact]
+    public async Task Utf8MultibyteCharacterCrossingByteLimitIsNotCountedAsOneCharacter()
+    {
+        const string json = "{\"value\":\"ééééé\"}";
+        var byteLength = System.Text.Encoding.UTF8.GetByteCount(json);
+        var exception = await Assert.ThrowsAsync<DeviceTransportException>(() =>
+            new DeviceTransport.SystemProcessInvoker(byteLength - 1, 64)
+                .InvokeAsync(OutputTextInvocation(json, "stdout"), CancellationToken.None));
+
+        Assert.Contains("output exceeded", exception.Message);
+        Assert.Equal(byteLength, exception.OutputBytesRead);
+    }
+
     private static RegisteredDevice Device(string connection) => new("dev1", "Build host", "ubuntu", connection,
         connection == "ssh" ? "build-host" : null, connection == "ssh" ? 2222 : null,
         connection == "ssh" ? "chen" : null, ["/workspace"], ["worker"], true,
@@ -166,6 +205,14 @@ public sealed class DeviceTransportTests
         return OperatingSystem.IsWindows()
             ? new("powershell.exe", ["-NoProfile", "-Command", $"Set-Content -LiteralPath '{escapedPath}' -Value $PID; while ($true) {{ [Console]::{(stream == "stdout" ? "Out" : "Error")}.Write(('x' * 100)); [Console]::{(stream == "stdout" ? "Out" : "Error")}.Flush() }}"], "", TimeSpan.FromSeconds(5))
             : new("/bin/sh", ["-c", $"echo $$ > '{escapedPath}'; exec yes x{(stream == "stderr" ? " >&2" : "")}"], "", TimeSpan.FromSeconds(5));
+    }
+
+    private static ProcessInvocation OutputTextInvocation(string output, string stream)
+    {
+        var escaped = output.Replace("'", "''", StringComparison.Ordinal);
+        return OperatingSystem.IsWindows()
+            ? new("powershell.exe", ["-NoProfile", "-Command", $"[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false; [Console]::{(stream == "stdout" ? "Out" : "Error")}.Write('{escaped}')"], "", TimeSpan.FromSeconds(5))
+            : new("/bin/sh", ["-c", $"printf '%s' '{escaped}'{(stream == "stderr" ? " >&2" : "")}"], "", TimeSpan.FromSeconds(5));
     }
 
     private static ProcessInvocation LongRunningInvocation(string pidFile, TimeSpan timeout)
