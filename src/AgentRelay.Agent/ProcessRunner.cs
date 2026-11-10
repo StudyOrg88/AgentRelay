@@ -151,11 +151,13 @@ public sealed class ProcessRunner
                 var child = selectedLauncher.Start(testStart);
                 process = child.Process;
                 var gate = new object();
-                process.OutputDataReceived += (_, e) => AppendSanitized(logPath, e.Data, gate);
-                process.ErrorDataReceived += (_, e) => AppendSanitized(logPath, e.Data, gate);
+                DataReceivedEventHandler outputHandler = (_, e) => AppendSanitized(logPath, e.Data, gate);
+                DataReceivedEventHandler errorHandler = (_, e) => AppendSanitized(logPath, e.Data, gate);
+                process.OutputDataReceived += outputHandler;
+                process.ErrorDataReceived += errorHandler;
                 process.BeginOutputReadLine(); process.BeginErrorReadLine();
                 child.StandardInput.WriteLine(rolePrompt + request.ToJson()); child.StandardInput.Close();
-                _ = PersistTestChildExitAsync(process, request.TaskId);
+                _ = PersistTestChildExitAsync(process, request.TaskId, outputHandler, errorHandler);
             }
             var identity = new ProcessIdentity(process.Id, process.StartTime.ToUniversalTime().Ticks);
             WriteLaunchIdentity(request.TaskId, launchToken, identity);
@@ -236,14 +238,20 @@ public sealed class ProcessRunner
         File.Delete(IdentityPath(taskId) + ".pid");
     }
 
-    private async Task PersistTestChildExitAsync(Process process, string taskId)
+    private async Task PersistTestChildExitAsync(Process process, string taskId,
+        DataReceivedEventHandler outputHandler, DataReceivedEventHandler errorHandler)
     {
-        await process.WaitForExitAsync().ConfigureAwait(false);
-        process.WaitForExit();
-        var identity = new ProcessIdentity(process.Id, process.StartTime.ToUniversalTime().Ticks);
-        var record = _store.FindByTaskId(taskId)!;
-        File.WriteAllText(ExitCodePath(taskId), $"{taskId}:{record.LaunchToken}:{identity.ProcessId}:{identity.StartTimeUtcTicks}:{process.ExitCode}");
-        process.Dispose();
+        try
+        {
+            await process.WaitForExitAsync().ConfigureAwait(false);
+            process.WaitForExit();
+            process.OutputDataReceived -= outputHandler;
+            process.ErrorDataReceived -= errorHandler;
+            var identity = new ProcessIdentity(process.Id, process.StartTime.ToUniversalTime().Ticks);
+            var record = _store.FindByTaskId(taskId)!;
+            File.WriteAllText(ExitCodePath(taskId), $"{taskId}:{record.LaunchToken}:{identity.ProcessId}:{identity.StartTimeUtcTicks}:{process.ExitCode}");
+        }
+        finally { process.Dispose(); }
     }
 
     private Process StartDetachedSupervisor(TaskRequest request, string workingDirectory, string inputPath, string logPath, string launchToken)
