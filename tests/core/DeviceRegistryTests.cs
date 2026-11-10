@@ -70,6 +70,36 @@ public sealed class DeviceRegistryTests
         Assert.Equal("fake-ubuntu-host", device.Host);
     }
 
+    [Theory]
+    [InlineData("host;touch")]
+    [InlineData("host$(id)")]
+    [InlineData("host`id`")]
+    [InlineData("host/name")]
+    [InlineData("host name")]
+    [InlineData("-leading-hyphen")]
+    [InlineData("bad..label")]
+    [InlineData("bad-label-")]
+    public void Load_rejects_ssh_hosts_outside_safe_alias_syntax(string host)
+    {
+        var result = Load("ubuntu", "ssh", host, 22, "codex-user", ["/home/codex/work"]);
+        Assert.Empty(result.Devices);
+        Assert.NotEmpty(result.Diagnostics);
+    }
+
+    [Theory]
+    [InlineData("user;touch")]
+    [InlineData("user$(id)")]
+    [InlineData("user`id`")]
+    [InlineData("user/name")]
+    [InlineData("user name")]
+    [InlineData("-leading-hyphen")]
+    public void Load_rejects_ssh_users_outside_safe_account_syntax(string user)
+    {
+        var result = Load("ubuntu", "ssh", "safe-host", 22, user, ["/home/codex/work"]);
+        Assert.Empty(result.Devices);
+        Assert.NotEmpty(result.Diagnostics);
+    }
+
     [Fact]
     public void Load_defaults_every_declared_role_to_one_when_concurrency_map_is_omitted()
     {

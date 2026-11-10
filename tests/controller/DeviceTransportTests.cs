@@ -1,5 +1,6 @@
 using AgentRelay.Controller;
 using AgentRelay.Core;
+using System.Diagnostics;
 using Xunit;
 
 namespace AgentRelay.Controller.Tests;
@@ -81,10 +82,113 @@ public sealed class DeviceTransportTests
         Assert.Null(fake.Invocation);
     }
 
+    [Theory]
+    [InlineData("agent;touch")]
+    [InlineData("/opt/agentrelay-agent")]
+    [InlineData("agent relay")]
+    public void RemoteExecutableMustBeASingleTrustedBasename(string executable)
+    {
+        Assert.Throws<ArgumentException>(() => new DeviceTransport(agentExecutable: executable));
+    }
+
+    [Fact]
+    public async Task TransportRejectsUnsafeSshHostAndUserEvenIfDeviceWasConstructedDirectly()
+    {
+        var fake = new FakeInvoker();
+        var transport = new DeviceTransport(processInvoker: fake);
+        foreach (var device in new[] { Device("ssh") with { Host = "safe;touch /tmp/pwned" },
+                     Device("ssh") with { User = "user$(id)" } })
+        {
+            await Assert.ThrowsAsync<DeviceTransportException>(() => transport.InvokeAsync(device, "status", "{}"));
+        }
+        Assert.Null(fake.Invocation);
+    }
+
+    [Fact]
+    public async Task RealProcessTimeoutKillsAndWaitsForChildProcess()
+    {
+        var pidFile = Path.Combine(Path.GetTempPath(), $"agentrelay-child-{Guid.NewGuid():N}.pid");
+        try
+        {
+            var invocation = LongRunningInvocation(pidFile, TimeSpan.FromMilliseconds(700));
+            var task = new DeviceTransport.SystemProcessInvoker().InvokeAsync(invocation, CancellationToken.None);
+            var pid = await WaitForPidAsync(pidFile);
+            await Assert.ThrowsAsync<DeviceTransportException>(() => task);
+            Assert.True(await WaitUntilExitedAsync(pid));
+        }
+        finally { File.Delete(pidFile); }
+    }
+
+    [Fact]
+    public async Task CallerCancellationIsPropagatedAndNotReportedAsTimeout()
+    {
+        var pidFile = Path.Combine(Path.GetTempPath(), $"agentrelay-child-{Guid.NewGuid():N}.pid");
+        try
+        {
+            using var cancellation = new CancellationTokenSource();
+            var task = new DeviceTransport.SystemProcessInvoker().InvokeAsync(LongRunningInvocation(pidFile, TimeSpan.FromSeconds(5)), cancellation.Token);
+            var pid = await WaitForPidAsync(pidFile);
+            cancellation.Cancel();
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => task);
+            Assert.True(await WaitUntilExitedAsync(pid));
+        }
+        finally { File.Delete(pidFile); }
+    }
+
+    [Theory]
+    [InlineData("stdout")]
+    [InlineData("stderr")]
+    public async Task ExcessiveOutputFailsAndTerminatesProcess(string stream)
+    {
+        var invocation = OutputInvocation(stream);
+        var invoker = new DeviceTransport.SystemProcessInvoker(maximumStandardOutputBytes: 1024, maximumStandardErrorBytes: 1024);
+        var exception = await Assert.ThrowsAsync<DeviceTransportException>(() => invoker.InvokeAsync(invocation, CancellationToken.None));
+        Assert.Contains("output exceeded", exception.Message);
+    }
+
     private static RegisteredDevice Device(string connection) => new("dev1", "Build host", "ubuntu", connection,
         connection == "ssh" ? "build-host" : null, connection == "ssh" ? 2222 : null,
         connection == "ssh" ? "chen" : null, ["/workspace"], ["worker"], true,
         new Dictionary<string, int> { ["worker"] = 1 });
+
+    private static ProcessInvocation OutputInvocation(string stream) => OperatingSystem.IsWindows()
+        ? new("powershell.exe", ["-NoProfile", "-Command", $"1..10000 | ForEach-Object {{ Write-{(stream == "stdout" ? "Output" : "Error")} ('x' * 100) }}"], "", TimeSpan.FromSeconds(5))
+        : new("/bin/sh", ["-c", stream == "stdout" ? "yes x" : "yes x >&2"], "", TimeSpan.FromSeconds(5));
+
+    private static ProcessInvocation LongRunningInvocation(string pidFile, TimeSpan timeout)
+    {
+        var escapedPath = pidFile.Replace("'", "''", StringComparison.Ordinal);
+        return OperatingSystem.IsWindows()
+            ? new("powershell.exe", ["-NoProfile", "-Command", $"$child = Start-Process powershell.exe -ArgumentList '-NoProfile','-Command','Start-Sleep -Seconds 30' -PassThru; Set-Content -LiteralPath '{escapedPath}' -Value $child.Id; Wait-Process -Id $child.Id"], "", timeout)
+            : new("/bin/sh", ["-c", $"sleep 30 & child=$!; echo $child > '{escapedPath}'; wait $child"], "", timeout);
+    }
+
+    private static async Task<int> WaitForPidAsync(string path)
+    {
+        var until = DateTime.UtcNow + TimeSpan.FromSeconds(3);
+        while (DateTime.UtcNow < until)
+        {
+            try
+            {
+                if (File.Exists(path) && int.TryParse(await File.ReadAllTextAsync(path), out var pid)) return pid;
+            }
+            catch (IOException) { }
+            await Task.Delay(20);
+        }
+        throw new TimeoutException("The child process did not record its PID.");
+    }
+
+    private static async Task<bool> WaitUntilExitedAsync(int pid)
+    {
+        var until = DateTime.UtcNow + TimeSpan.FromSeconds(3);
+        while (DateTime.UtcNow < until)
+        {
+            try { if (Process.GetProcessById(pid).HasExited) return true; }
+            catch (ArgumentException) { return true; }
+            await Task.Delay(25);
+        }
+        return false;
+    }
 
     private sealed class FakeInvoker : IProcessInvoker
     {
