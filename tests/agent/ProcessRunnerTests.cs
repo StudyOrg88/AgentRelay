@@ -17,7 +17,8 @@ public sealed class ProcessRunnerTests
         var request = Request("task-survive");
         store.Submit(request);
         var supervisor = new FakeSupervisor();
-        var runner = new ProcessRunner(store, Path.Combine(temp.Path, "logs"), supervisor, launcher: new DeterministicLauncher(temp.Path));
+        var launcher = new DeterministicLauncher(temp.Path);
+        var runner = new ProcessRunner(store, Path.Combine(temp.Path, "logs"), supervisor, launcher: launcher);
         runner.Start(request, temp.Path);
 
         var immediately = runner.GetVerifiedIdentity(request.TaskId);
@@ -33,6 +34,7 @@ public sealed class ProcessRunnerTests
         Assert.DoesNotContain("bearersecret", persistedLog);
         Assert.DoesNotContain("querysecret", persistedLog);
         await WaitUntilAsync(() => File.Exists(Path.Combine(temp.Path, "logs", request.TaskId + ".exitcode")));
+        await launcher.WaitForExitAsync();
         Assert.False(new SystemProcessSupervisor().IsAlive(store.FindByTaskId(request.TaskId)!.ProcessIdentity!));
         supervisor.Alive = false;
         var recoveredRunner = new ProcessRunner(new TaskStore(Path.Combine(temp.Path, "state")), Path.Combine(temp.Path, "logs"), supervisor);
@@ -109,13 +111,15 @@ public sealed class ProcessRunnerTests
         var store = new TaskStore(Path.Combine(temp.Path, "state"));
         var request = Request("task-secret") with { IdempotencyKey = "Bearer supersecret" };
         store.Submit(request);
-        var runner = new ProcessRunner(store, Path.Combine(temp.Path, "logs"), launcher: new DeterministicLauncher(temp.Path));
+        var launcher = new DeterministicLauncher(temp.Path);
+        var runner = new ProcessRunner(store, Path.Combine(temp.Path, "logs"), launcher: launcher);
 
         runner.Start(request, temp.Path);
 
         var inputPath = Path.Combine(temp.Path, "logs", request.TaskId + ".input.json");
         Assert.False(File.Exists(inputPath));
         await WaitUntilAsync(() => File.Exists(Path.Combine(temp.Path, "logs", request.TaskId + ".exitcode")));
+        await launcher.WaitForExitAsync();
         Assert.Contains("[redacted]", File.ReadAllText(Path.Combine(temp.Path, "logs", request.TaskId + ".log")));
     }
 
@@ -326,6 +330,10 @@ public sealed class ProcessRunnerTests
     }
     private sealed class DeterministicLauncher(string directory) : IChildProcessLauncher
     {
+        private Task? _completion;
+
+        public Task WaitForExitAsync() => _completion ?? throw new InvalidOperationException("Child was not started.");
+
         public ChildProcess Start(ProcessStartInfo ignored)
         {
             var start = new ProcessStartInfo(OperatingSystem.IsWindows() ? "powershell.exe" : "/bin/sh")
@@ -339,8 +347,19 @@ public sealed class ProcessRunnerTests
             {
                 start.ArgumentList.Add("-c"); start.ArgumentList.Add("echo stdout-line; echo token=topsecret >&2; echo '{\"token\":\"jsonsecret\"}'; echo 'Bearer bearersecret'; echo 'https://host/?access_token=querysecret'; sleep 2; exit 0");
             }
-            var process = Process.Start(start)!;
+            var process = System.Diagnostics.Process.Start(start)!;
+            var observer = System.Diagnostics.Process.GetProcessById(process.Id);
+            _completion = ObserveExitAsync(observer);
             return new ChildProcess(process, process.StandardInput);
+        }
+
+        private static async Task ObserveExitAsync(Process process)
+        {
+            using (process)
+            {
+                await process.WaitForExitAsync();
+                process.WaitForExit();
+            }
         }
     }
     private sealed class CountingLauncher : IChildProcessLauncher

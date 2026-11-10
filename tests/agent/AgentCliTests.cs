@@ -273,9 +273,19 @@ public sealed class AgentCliTests
         public void Dispose()
         {
             if (!Directory.Exists(Path)) return;
-            foreach (var entry in Directory.EnumerateFileSystemEntries(Path, "*", SearchOption.AllDirectories))
-                try { File.SetAttributes(entry, FileAttributes.Normal); } catch { }
-            Directory.Delete(Path, true);
+            var deadline = DateTime.UtcNow.AddSeconds(3);
+            while (true)
+            {
+                try
+                {
+                    foreach (var entry in Directory.EnumerateFileSystemEntries(Path, "*", SearchOption.AllDirectories))
+                        try { File.SetAttributes(entry, FileAttributes.Normal); } catch { }
+                    Directory.Delete(Path, true);
+                    return;
+                }
+                catch (IOException) when (DateTime.UtcNow < deadline) { Thread.Sleep(25); }
+                catch (UnauthorizedAccessException) when (DateTime.UtcNow < deadline) { Thread.Sleep(25); }
+            }
         }
     }
 }
