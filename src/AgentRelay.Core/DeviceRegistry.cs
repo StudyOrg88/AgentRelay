@@ -33,6 +33,8 @@ public static class DeviceRegistry
     ];
     private static readonly HashSet<string> ValidRoles = ["worker", "reviewer"];
     private static readonly Regex SafeIdentifier = new(@"\A[A-Za-z0-9][A-Za-z0-9._-]*\z", RegexOptions.CultureInvariant);
+    private static readonly Regex SafeSshHost = new(@"\A(?=.{1,253}\z)[A-Za-z0-9](?:[A-Za-z0-9_-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9_-]{0,61}[A-Za-z0-9])?)*\z", RegexOptions.CultureInvariant);
+    private static readonly Regex SafeSshUser = new(@"\A[A-Za-z0-9_][A-Za-z0-9._-]*\z", RegexOptions.CultureInvariant);
 
     public static DeviceRegistryResult Load(string path, string repositoryRoot)
     {
@@ -121,7 +123,7 @@ public static class DeviceRegistry
         {
             host = ReadNullableString(hostElement);
             user = ReadNullableString(userElement);
-            if (host is null || user is null || !SafeIdentifier.IsMatch(host) || !SafeIdentifier.IsMatch(user) ||
+            if (host is null || user is null || !SafeSshHost.IsMatch(host) || !SafeSshUser.IsMatch(user) ||
                 portElement.ValueKind != JsonValueKind.Number || !portElement.TryGetInt32(out var parsedPort) ||
                 parsedPort is < 1 or > 65535)
                 throw new InvalidEntryException();
