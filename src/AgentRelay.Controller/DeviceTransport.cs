@@ -135,17 +135,19 @@ public sealed class DeviceTransport
                 CreateNoWindow = true
             }};
             foreach (var argument in invocation.Arguments) process.StartInfo.ArgumentList.Add(argument);
-            if (maximumStandardOutputBytes < 1 || maximumStandardErrorBytes < 1)
+            const int maximumSupportedOutputBytes = 64 * 1024 * 1024;
+            if (maximumStandardOutputBytes is < 1 or > maximumSupportedOutputBytes ||
+                maximumStandardErrorBytes is < 1 or > maximumSupportedOutputBytes)
                 throw new ArgumentOutOfRangeException(nameof(maximumStandardOutputBytes));
             using var timeout = new CancellationTokenSource(invocation.Timeout);
             using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeout.Token);
-            Task<string>? stdout = null;
-            Task<string>? stderr = null;
+            Task<byte[]>? stdout = null;
+            Task<byte[]>? stderr = null;
             try
             {
                 if (!process.Start()) throw new DeviceTransportException("Could not start agent process.");
-                stdout = ReadBoundedAsync(process.StandardOutput, maximumStandardOutputBytes, linked.Token);
-                stderr = ReadBoundedAsync(process.StandardError, maximumStandardErrorBytes, linked.Token);
+                stdout = ReadBoundedAsync(process.StandardOutput.BaseStream, maximumStandardOutputBytes, linked.Token);
+                stderr = ReadBoundedAsync(process.StandardError.BaseStream, maximumStandardErrorBytes, linked.Token);
                 await process.StandardInput.WriteAsync(invocation.StandardInput.AsMemory(), linked.Token).ConfigureAwait(false);
                 process.StandardInput.Close();
                 var pending = new List<Task>
@@ -158,13 +160,20 @@ public sealed class DeviceTransport
                     pending.Remove(completed);
                     await completed.ConfigureAwait(false);
                 }
-                return new ProcessResult(process.ExitCode, await stdout.ConfigureAwait(false), await stderr.ConfigureAwait(false));
+                try
+                {
+                    return new ProcessResult(process.ExitCode,
+                        new System.Text.UTF8Encoding(false, true).GetString(await stdout.ConfigureAwait(false)),
+                        System.Text.Encoding.UTF8.GetString(await stderr.ConfigureAwait(false)));
+                }
+                catch (System.Text.DecoderFallbackException)
+                { throw new DeviceTransportException("Agent returned invalid UTF-8 output."); }
             }
-            catch (OutputLimitExceededException)
+            catch (OutputLimitExceededException exception)
             {
                 await StopAndWaitAsync(process).ConfigureAwait(false);
                 await ObserveAsync(stdout, stderr).ConfigureAwait(false);
-                throw new DeviceTransportException("Agent output exceeded the configured limit.");
+                throw new DeviceTransportException("Agent output exceeded the configured limit.", exception.BytesRead);
             }
             catch (OperationCanceledException)
             {
@@ -177,18 +186,24 @@ public sealed class DeviceTransport
             { throw new DeviceTransportException("Could not start agent process."); }
         }
 
-        private static async Task<string> ReadBoundedAsync(StreamReader reader, int maximumBytes, CancellationToken cancellationToken)
+        private static async Task<byte[]> ReadBoundedAsync(Stream stream, int maximumBytes, CancellationToken cancellationToken)
         {
-            var buffer = new char[4096];
-            var output = new System.Text.StringBuilder();
-            var bytes = 0;
+            var output = new byte[maximumBytes];
+            var detectionByte = new byte[1];
+            var bytesRead = 0;
             while (true)
             {
-                var count = await reader.ReadAsync(buffer.AsMemory(), cancellationToken).ConfigureAwait(false);
-                if (count == 0) return output.ToString();
-                bytes += System.Text.Encoding.UTF8.GetByteCount(buffer.AsSpan(0, count));
-                if (bytes > maximumBytes) throw new OutputLimitExceededException();
-                output.Append(buffer, 0, count);
+                if (bytesRead == maximumBytes)
+                {
+                    if (await stream.ReadAsync(detectionByte.AsMemory(), cancellationToken).ConfigureAwait(false) != 0)
+                        throw new OutputLimitExceededException(maximumBytes + 1);
+                    return output;
+                }
+
+                var count = await stream.ReadAsync(output.AsMemory(bytesRead,
+                    Math.Min(4096, maximumBytes - bytesRead)), cancellationToken).ConfigureAwait(false);
+                if (count == 0) return output[..bytesRead];
+                bytesRead += count;
             }
         }
 
@@ -213,7 +228,7 @@ public sealed class DeviceTransport
             }
         }
 
-        private static async Task ObserveAsync(params Task<string>?[] readers)
+        private static async Task ObserveAsync(params Task<byte[]>?[] readers)
         {
             foreach (var reader in readers)
             {
@@ -226,8 +241,14 @@ public sealed class DeviceTransport
             }
         }
 
-        private sealed class OutputLimitExceededException : Exception;
+        private sealed class OutputLimitExceededException(int bytesRead) : Exception
+        {
+            public int BytesRead { get; } = bytesRead;
+        }
     }
 }
 
-public sealed class DeviceTransportException(string message) : Exception(message);
+public sealed class DeviceTransportException(string message, int? outputBytesRead = null) : Exception(message)
+{
+    public int? OutputBytesRead { get; } = outputBytesRead;
+}

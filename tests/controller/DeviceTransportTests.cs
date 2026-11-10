@@ -140,10 +140,19 @@ public sealed class DeviceTransportTests
     [InlineData("stderr")]
     public async Task ExcessiveOutputFailsAndTerminatesProcess(string stream)
     {
-        var invocation = OutputInvocation(stream);
-        var invoker = new DeviceTransport.SystemProcessInvoker(maximumStandardOutputBytes: 1024, maximumStandardErrorBytes: 1024);
-        var exception = await Assert.ThrowsAsync<DeviceTransportException>(() => invoker.InvokeAsync(invocation, CancellationToken.None));
-        Assert.Contains("output exceeded", exception.Message);
+        var pidFile = Path.Combine(Path.GetTempPath(), $"agentrelay-output-{Guid.NewGuid():N}.pid");
+        try
+        {
+            var invocation = OutputInvocation(stream, pidFile);
+            var invoker = new DeviceTransport.SystemProcessInvoker(maximumStandardOutputBytes: 1024, maximumStandardErrorBytes: 1024);
+            var task = invoker.InvokeAsync(invocation, CancellationToken.None);
+            var pid = await WaitForPidAsync(pidFile);
+            var exception = await Assert.ThrowsAsync<DeviceTransportException>(() => task);
+            Assert.Contains("output exceeded", exception.Message);
+            Assert.Equal(1025, exception.OutputBytesRead);
+            Assert.True(await WaitUntilExitedAsync(pid));
+        }
+        finally { File.Delete(pidFile); }
     }
 
     private static RegisteredDevice Device(string connection) => new("dev1", "Build host", "ubuntu", connection,
@@ -151,9 +160,13 @@ public sealed class DeviceTransportTests
         connection == "ssh" ? "chen" : null, ["/workspace"], ["worker"], true,
         new Dictionary<string, int> { ["worker"] = 1 });
 
-    private static ProcessInvocation OutputInvocation(string stream) => OperatingSystem.IsWindows()
-        ? new("powershell.exe", ["-NoProfile", "-Command", $"1..10000 | ForEach-Object {{ Write-{(stream == "stdout" ? "Output" : "Error")} ('x' * 100) }}"], "", TimeSpan.FromSeconds(5))
-        : new("/bin/sh", ["-c", stream == "stdout" ? "yes x" : "yes x >&2"], "", TimeSpan.FromSeconds(5));
+    private static ProcessInvocation OutputInvocation(string stream, string pidFile)
+    {
+        var escapedPath = pidFile.Replace("'", "''", StringComparison.Ordinal);
+        return OperatingSystem.IsWindows()
+            ? new("powershell.exe", ["-NoProfile", "-Command", $"Set-Content -LiteralPath '{escapedPath}' -Value $PID; while ($true) {{ [Console]::{(stream == "stdout" ? "Out" : "Error")}.Write(('x' * 100)); [Console]::{(stream == "stdout" ? "Out" : "Error")}.Flush() }}"], "", TimeSpan.FromSeconds(5))
+            : new("/bin/sh", ["-c", $"echo $$ > '{escapedPath}'; exec yes x{(stream == "stderr" ? " >&2" : "")}"], "", TimeSpan.FromSeconds(5));
+    }
 
     private static ProcessInvocation LongRunningInvocation(string pidFile, TimeSpan timeout)
     {
