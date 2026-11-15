@@ -1,7 +1,7 @@
 {
   "schema_version": "acceptance/v1",
   "task_id": "agentrelay_legacy_foundation_integration",
-  "reviewed_code_commit": "2f3c821b8f1b23a0b17c4259d5f09d110d88eb60",
+  "reviewed_code_commit": "8d2e84dcd74945df6e7c6e0177fc4731145a8681",
   "acceptance_base_commit": "490119a8fb17bbc0c94a52ca6d17356837b6427f",
   "record_commit_parent": "8d2e84dcd74945df6e7c6e0177fc4731145a8681",
   "items": [
