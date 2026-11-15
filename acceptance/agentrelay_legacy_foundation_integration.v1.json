@@ -3,7 +3,7 @@
   "task_id": "agentrelay_legacy_foundation_integration",
   "reviewed_code_commit": "8d2e84dcd74945df6e7c6e0177fc4731145a8681",
   "acceptance_base_commit": "490119a8fb17bbc0c94a52ca6d17356837b6427f",
-  "record_commit_parent": "8d2e84dcd74945df6e7c6e0177fc4731145a8681",
+  "record_commit_parent": "10e0c3d8ebdb36a2bff78931fff28ba43296c9e2",
   "items": [
     {
       "id": "isolated_master_diff",
@@ -35,6 +35,20 @@
       "rejected_evidence": [
         "Any required test failed, was skipped, or was not run against the PR code commit.",
         "A command/test result cannot be reproduced or is associated with another code SHA."
+      ],
+      "owner_task": "agentrelay_legacy_foundation_integration"
+    },
+    {
+      "id": "pull_request_ci_not_configured",
+      "status": "not_applicable",
+      "merge_blocking": false,
+      "evidence_type": "command",
+      "accepted_evidence": [
+        "The master tree has no files under .github/workflows and GitHub reports no checks for PR #9; this task therefore requires no CI checks.",
+        "The required local .NET and PowerShell test commands are recorded in legacy_tests_pass."
+      ],
+      "rejected_evidence": [
+        "If required pull_request CI checks are configured for the repository, missing or unsuccessful checks for the current PR HEAD cannot be treated as passing."
       ],
       "owner_task": "agentrelay_legacy_foundation_integration"
     }
