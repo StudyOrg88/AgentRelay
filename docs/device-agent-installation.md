@@ -1,3 +1,7 @@
+# Legacy / Experimental
+
+This guide describes the existing .NET task-agent and SSH transport components only. They are retained as legacy/experimental infrastructure and are not the AgentRelay Codex Desktop session workflow. This baseline does not deliver a standalone Controller CLI; do not treat it as an end-to-end runnable orchestrator.
+
 # Device Agent Installation and Preflight
 
 This guide prepares a registered Windows or Ubuntu host for AgentRelay. Registry values are configuration, not credentials. Do not place passwords, private keys, tokens, or prompts in SSH arguments.
