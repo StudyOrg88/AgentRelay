@@ -1,0 +1,42 @@
+{
+  "schema_version": "acceptance/v1",
+  "task_id": "agentrelay_legacy_foundation_integration",
+  "reviewed_code_commit": "2f3c821b8f1b23a0b17c4259d5f09d110d88eb60",
+  "acceptance_base_commit": "490119a8fb17bbc0c94a52ca6d17356837b6427f",
+  "record_commit_parent": "8d2e84dcd74945df6e7c6e0177fc4731145a8681",
+  "items": [
+    {
+      "id": "isolated_master_diff",
+      "status": "passed",
+      "merge_blocking": true,
+      "evidence_type": "artifact",
+      "accepted_evidence": [
+        "Origin commits 8a83d82^..919dc67 were cherry-picked onto task branch from master commit 490119a.",
+        "PR comparison contains the 28-file legacy foundation tree diff and the approved integration plan; it excludes source-worktree uncommitted files.",
+        "docs/device-agent-installation.md identifies the Agent/SSH components as legacy/experimental and states that no standalone Controller CLI is delivered."
+      ],
+      "rejected_evidence": [
+        "Any PR file or commit sourced from uncommitted/untracked changes in the original feature worktree.",
+        "Documentation presenting the .NET/SSH baseline as the Codex Desktop session workflow."
+      ],
+      "owner_task": "agentrelay_legacy_foundation_integration"
+    },
+    {
+      "id": "legacy_tests_pass",
+      "status": "passed",
+      "merge_blocking": true,
+      "evidence_type": "command",
+      "accepted_evidence": [
+        "dotnet test tests/core/AgentRelay.Core.Tests.csproj: 63 passed, 0 failed.",
+        "dotnet test tests/controller/AgentRelay.Controller.Tests.csproj: 18 passed, 0 failed.",
+        "dotnet test tests/agent/AgentRelay.Agent.Tests.csproj: 44 passed, 0 failed.",
+        "All 17 tests/test_*.ps1 scripts passed; git diff --check produced no errors."
+      ],
+      "rejected_evidence": [
+        "Any required test failed, was skipped, or was not run against the PR code commit.",
+        "A command/test result cannot be reproduced or is associated with another code SHA."
+      ],
+      "owner_task": "agentrelay_legacy_foundation_integration"
+    }
+  ]
+}
