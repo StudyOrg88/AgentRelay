@@ -1,0 +1,28 @@
+{
+  "schema_version": "acceptance/v1",
+  "task_id": "orchestrator_merge_gate_contract_matrix",
+  "reviewed_code_commit": "f4cb0924f4aed7d6be33c1527e85a5a21a311193",
+  "acceptance_base_commit": "06c0d1449958923c8c0c32450b3ac3fe339e30c2",
+  "record_commit_parent": "f4cb0924f4aed7d6be33c1527e85a5a21a311193",
+  "items": [
+    {
+      "id": "decision_matrix_contract",
+      "status": "pending",
+      "merge_blocking": true,
+      "evidence_type": "command",
+      "accepted_evidence": [
+        "Windows 10 Professional / PowerShell 7.6.10 at code commit f4cb0924f4aed7d6be33c1527e85a5a21a311193: both targeted Orchestrator contract tests and all 17 tests/*.ps1 scripts passed; git diff --check passed.",
+        "Ubuntu aarch64 / PowerShell 7.4.13 must run both targeted Orchestrator contract tests and all 17 tests/*.ps1 scripts against the updated PR tree; record commands, counts, and exit codes before marking this item passed.",
+        "Static contract tests parse the normative decision matrix, check every required scenario's exact facts and outcome, reject missing/duplicate/reversed rows and known fail-open contradictions using in-memory mutations, and preserve Acceptance/Reviewer invariants.",
+        "Reports identify these as static Skill contract tests and do not claim Merge Bot runtime behavior was executed.",
+        "git diff --check passes for the delivered PR changes."
+      ],
+      "rejected_evidence": [
+        "Keyword-presence-only assertions without parsing scenario facts and expected outcomes.",
+        "A glob command that does not demonstrate that all 17 scripts actually ran.",
+        "Windows results presented as Linux verification, or claims that static contract tests execute Merge Bot runtime branches."
+      ],
+      "owner_task": "orchestrator_merge_gate_contract_matrix"
+    }
+  ]
+}
