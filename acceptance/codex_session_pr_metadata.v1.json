@@ -1,0 +1,37 @@
+{
+  "schema_version": "acceptance/v1",
+  "task_id": "codex_session_pr_metadata",
+  "reviewed_code_commit": "ae366cecb4b779f081e6e1f5539955bad416ea1f",
+  "acceptance_base_commit": "ae366cecb4b779f081e6e1f5539955bad416ea1f",
+  "record_commit_parent": "ae366cecb4b779f081e6e1f5539955bad416ea1f",
+  "items": [
+    {
+      "id": "issue_only_routes_worker",
+      "status": "passed",
+      "merge_blocking": true,
+      "evidence_type": "command",
+      "accepted_evidence": [
+        "dotnet test tests/controller/AgentRelay.Controller.Tests.csproj --filter FullyQualifiedName~GitHubStateReader: 11 passed, including Issue-only read and Worker routing.",
+        "dotnet test tests/core/AgentRelay.Core.Tests.csproj --filter FullyQualifiedName~TaskLifecycle: 2 passed, including planned Issue-only Worker routing and incomplete-dependency blocking."
+      ],
+      "rejected_evidence": [
+        "Issue without a PR fails to read or cannot route a planned task to Worker."
+      ],
+      "owner_task": "codex_session_pr_metadata"
+    },
+    {
+      "id": "pr_metadata_fails_closed",
+      "status": "passed",
+      "merge_blocking": true,
+      "evidence_type": "command",
+      "accepted_evidence": [
+        "PR-present tests parse base SHA, base ref, and repository default branch.",
+        "Missing or malformed base metadata and merged PRs without a full merge_commit_sha are rejected."
+      ],
+      "rejected_evidence": [
+        "Invalid PR metadata still allows Acceptance or merge gates to continue."
+      ],
+      "owner_task": "codex_session_pr_metadata"
+    }
+  ]
+}
