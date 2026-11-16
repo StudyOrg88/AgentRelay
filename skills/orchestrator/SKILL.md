@@ -83,6 +83,23 @@ agentrelay_merge:
 
 本节的 required CI 指 Branch Protection 与适用 Repository Rulesets 实际要求的 required checks；CI 工具是否存在与 required checks 是否配置是两个独立事实。
 
+### 合并门禁决策矩阵
+
+本矩阵是唯一规范判定来源；说明性正文不得覆盖或改变矩阵结果。`PASS_THIS_GATE` 只表示通过该行对应的检查门禁，不构成合并授权；Acceptance、独立 Reviewer、项目验证、PR 状态及其他现有 Merge Gate 仍须分别满足。命中阻断或暂停条件时，不得被任何通过条件降级。
+
+| 优先级 | 场景 ID | 条件 | 门禁结果 | 替代来源策略 |
+|---|---|---|---|---|
+| P0 | protection-unverified | Branch Protection 或适用 Repository Rulesets 未完整读取、适用性不明、权限不足或结果矛盾；Checks API 为空不改变结论 | PAUSE | NOT_ALLOWED |
+| P1 | empty-checks-protection-unverified | Checks API 返回零条结果，但 Branch Protection 或适用 Rulesets 尚未确认 | PAUSE | NOT_ALLOWED |
+| P2 | authoritative-check-non-success | 权威来源明确报告 required check 失败、等待中、运行中或 SHA 不匹配，即使其他来源报告成功 | BLOCK | CANNOT_OVERRIDE |
+| P3 | required-check-result-missing-or-stale | required check 结果缺失、集合不完整，或仅匹配旧、短、其他 PR 或分支 SHA | BLOCK | NOT_ALLOWED |
+| P4 | premerge-state-changed | 合并前 HEAD、BASE、仓库身份、保护规则或 required-check 集合发生变化 | REVALIDATE | NOT_ALLOWED |
+| P5 | alternate-source-complete | 原查询源不可用或结果不完整；替代来源证明同一检查身份、当前完整 HEAD SHA、成功结论和完整检查集合，且无权威非成功结果 | PASS_THIS_GATE | ONLY_WHEN_SOURCE_UNAVAILABLE_OR_INCOMPLETE |
+| P6 | required-checks-all-pass-current-head | required-check 集合完整已知，且每项均成功并绑定当前完整 PR HEAD SHA | PASS_THIS_GATE | NOT_NEEDED |
+| P7 | no-required-checks-evidence-complete | Branch Protection 与适用 Rulesets 已完整确认无 required checks，且本次所需项目验证证据完整 | PASS_THIS_GATE | NOT_NEEDED |
+| P8 | no-required-checks-evidence-incomplete | 已确认无 required checks，但本次必要项目验证证据缺失、失败、过期或无法验证 | BLOCK | NOT_ALLOWED |
+| P9 | acceptance-review-gate-incomplete | Acceptance、独立 Reviewer 或其他现有 Merge Gate 未满足，不因 required checks 通过或缺失而豁免 | BLOCK | NOT_ALLOWED |
+
 - **先确定要求，再检查结果。** 对规范身份已验证的目标仓库和 PR 实际 base 分支，分别读取 Branch Protection 与所有可能适用的 Repository Rulesets。确认规则读取完整、Rulesets 对该分支的适用性明确，并汇总所有实际生效规则要求的 required checks；不能只选取其中一条规则，也不能遗漏不同规则的叠加要求。按需要使用 Branch Protection、Rulesets、Checks API、Commit Status 等权威来源。
 - required checks 通过不能替代 Acceptance、独立 Reviewer 或与本次变更风险相符的项目验证证据；这些仍是彼此独立的合并门槛。
 - 无法读取 Branch Protection 或 Rulesets、权限不足、API `403`、`404` 语义不明确、无法确认 Ruleset 是否适用、查询不完整或结果矛盾时，暂停合并并按本技能的结构化失败格式报告。**不得把读取失败解释为“没有配置 required checks”。** Checks API 返回 0 条结果不等于目标分支没有 required checks；在规则集合已完整确定之前，空结果不能证明没有 required checks。

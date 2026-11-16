@@ -68,6 +68,28 @@ if ($protectionSection -notmatch [regex]::Escape('必要证据缺失、失败、
 if ($protectionSection -notmatch [regex]::Escape('必须逐项核验完整集合')) {
     throw 'Required checks must be verified individually.'
 }
+$matrixMatch = [regex]::Match($skill, '(?ms)^### 合并门禁决策矩阵\s*\r?\n(?<body>.*?)(?=^### |\z)')
+if (-not $matrixMatch.Success) { throw 'Normative merge-gate decision matrix is missing.' }
+$matrixRows = @()
+foreach ($line in ($matrixMatch.Groups['body'].Value -split "`r?`n")) {
+    if ($line -match '^\|\s*(?<priority>P\d+)\s*\|\s*(?<id>[a-z0-9-]+)\s*\|\s*(?<facts>.*?)\s*\|\s*(?<outcome>[A-Z_]+)\s*\|\s*(?<alternate>[A-Z_]+)\s*\|\s*$') {
+        $matrixRows += [pscustomobject]@{ Id = $Matches.id; Facts = $Matches.facts; Outcome = $Matches.outcome; Alternate = $Matches.alternate }
+    }
+}
+foreach ($scenario in @(
+    @{ Id = 'no-required-checks-evidence-complete'; Outcome = 'PASS_THIS_GATE'; Facts = 'Branch Protection 与适用 Rulesets 已完整确认无 required checks，且本次所需项目验证证据完整' },
+    @{ Id = 'no-required-checks-evidence-incomplete'; Outcome = 'BLOCK'; Facts = '已确认无 required checks，但本次必要项目验证证据缺失、失败、过期或无法验证' },
+    @{ Id = 'acceptance-review-gate-incomplete'; Outcome = 'BLOCK'; Facts = 'Acceptance、独立 Reviewer 或其他现有 Merge Gate 未满足，不因 required checks 通过或缺失而豁免' }
+)) {
+    $matches = @($matrixRows | Where-Object Id -CEQ $scenario.Id)
+    if ($matches.Count -ne 1 -or $matches[0].Outcome -cne $scenario.Outcome -or $matches[0].Facts -cne $scenario.Facts) {
+        throw "Acceptance decision-matrix scenario '$($scenario.Id)' is missing, duplicated, or has a weakened outcome."
+    }
+}
+if ($matrixRows.Count -ne @($matrixRows | Group-Object Id).Count) { throw 'Decision matrix contains conflicting duplicate scenario IDs.' }
+if ($skill -notmatch [regex]::Escape('本矩阵是唯一规范判定来源；说明性正文不得覆盖或改变矩阵结果')) {
+    throw 'Acceptance safeguards must be part of the normative decision matrix.'
+}
 $scriptText = Get-Content -LiteralPath $PSCommandPath -Raw
 $windowsDrivePattern = '[A-Z]:' + '\\'
 $legacyExecutableName = 'powershell' + '.exe'
