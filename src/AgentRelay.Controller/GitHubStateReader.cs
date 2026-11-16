@@ -159,7 +159,7 @@ public sealed class GhGitHubClient : IGitHubClient
         var repository = match.Groups["repo"].Value;
         var number = match.Groups["number"].Value;
         var issueJson = await ReadApiAsync($"repos/{owner}/{repository}/issues/{number}", cancellationToken).ConfigureAwait(false);
-        var timelineJson = await ReadApiAsync($"repos/{owner}/{repository}/issues/{number}/timeline?per_page=100", cancellationToken).ConfigureAwait(false);
+        var timelineJson = await ReadApiAsync($"repos/{owner}/{repository}/issues/{number}/timeline?per_page=100", cancellationToken, paginate: true).ConfigureAwait(false);
         var issueUrl = $"https://github.com/{owner}/{repository}/issues/{number}";
         var dependencies = await ReadDependenciesAsync(owner, repository, number, issueJson, cancellationToken).ConfigureAwait(false);
         var prUrl = FindAssociatedPullRequest(timelineJson, owner, repository);
@@ -208,15 +208,16 @@ public sealed class GhGitHubClient : IGitHubClient
         return JsonSerializer.Serialize(normalized);
     }
 
-    private async Task<string> ReadApiAsync(string route, CancellationToken cancellationToken)
+    private async Task<string> ReadApiAsync(string route, CancellationToken cancellationToken, bool paginate = false)
     {
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         timeout.CancelAfter(_timeout);
         ProcessResult result;
         try
         {
+            var arguments = paginate ? new[] { "api", "--paginate", route } : ["api", route];
             result = await _processInvoker.InvokeAsync(new ProcessInvocation(_ghExecutable,
-                ["api", route], "", _timeout), timeout.Token).ConfigureAwait(false);
+                arguments, "", _timeout), timeout.Token).ConfigureAwait(false);
         }
         catch (OperationCanceledException) { throw; }
         catch (Exception exception) { throw new GitHubClientException($"GitHub API request failed: {exception.GetType().Name}."); }

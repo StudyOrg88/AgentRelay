@@ -102,6 +102,39 @@ public sealed class GitHubStateReaderTests
         Assert.Contains("repos/acme/repo", process.Routes);
     }
 
+    [Fact]
+    public async Task Production_gh_client_paginates_timeline_before_concluding_pr_is_absent()
+    {
+        var timeline = Enumerable.Range(1, 100)
+            .Select(index => new { @event = "labeled", id = index })
+            .Cast<object>()
+            .Append(new
+            {
+                @event = "cross-referenced",
+                source = new
+                {
+                    issue = new
+                    {
+                        html_url = "https://github.com/acme/repo/pull/9",
+                        pull_request = new { url = "https://api.github.com/repos/acme/repo/pulls/9" }
+                    }
+                }
+            });
+        var process = new FakeGhProcessInvoker(new Dictionary<string, string>
+        {
+            ["repos/acme/repo/issues/7"] = """{"number":7,"html_url":"https://github.com/acme/repo/issues/7","body":"depends_on: none","labels":[{"name":"task:planned"}]}""",
+            ["repos/acme/repo/issues/7/timeline?per_page=100"] = JsonSerializer.Serialize(timeline),
+            ["repos/acme/repo/pulls/9"] = $$"""{"number":9,"html_url":"https://github.com/acme/repo/pull/9","state":"open","draft":false,"merged":false,"head":{"sha":"{{new string('a', 40)}}"},"base":{"sha":"{{new string('b', 40)}}","ref":"master"},"merge_commit_sha":null}""",
+            ["repos/acme/repo"] = """{"default_branch":"master"}"""
+        });
+
+        var json = await new GhGitHubClient(processInvoker: process).ReadIssueStateAsync("https://github.com/acme/repo/issues/7");
+        var snapshot = await new GitHubStateReader(new FakeGitHubClient(json)).ReadAsync("https://github.com/acme/repo/issues/7");
+
+        Assert.Equal(9, snapshot.PullRequestNumber);
+        Assert.Contains(process.Invocations, invocation => invocation.Arguments.Contains("--paginate"));
+    }
+
     private static string IssueOnlyJson => JsonSerializer.Serialize(new
     {
         repository = "acme/repo",
@@ -141,10 +174,12 @@ public sealed class GitHubStateReaderTests
     private sealed class FakeGhProcessInvoker(IReadOnlyDictionary<string, string> responses) : IProcessInvoker
     {
         public List<string> Routes { get; } = [];
+        public List<ProcessInvocation> Invocations { get; } = [];
 
         public Task<ProcessResult> InvokeAsync(ProcessInvocation invocation, CancellationToken cancellationToken)
         {
-            var route = invocation.Arguments[1];
+            Invocations.Add(invocation);
+            var route = invocation.Arguments[^1];
             Routes.Add(route);
             return responses.TryGetValue(route, out var response)
                 ? Task.FromResult(new ProcessResult(0, response, ""))
