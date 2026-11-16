@@ -105,11 +105,12 @@ public sealed class GitHubStateReaderTests
     [Fact]
     public async Task Production_gh_client_paginates_timeline_before_concluding_pr_is_absent()
     {
-        var timeline = Enumerable.Range(1, 100)
+        var firstPage = Enumerable.Range(1, 100)
             .Select(index => new { @event = "labeled", id = index })
             .Cast<object>()
-            .Append(new
-            {
+            .ToArray();
+        object[] secondPage = [new
+        {
                 @event = "cross-referenced",
                 source = new
                 {
@@ -119,11 +120,11 @@ public sealed class GitHubStateReaderTests
                         pull_request = new { url = "https://api.github.com/repos/acme/repo/pulls/9" }
                     }
                 }
-            });
+            }];
         var process = new FakeGhProcessInvoker(new Dictionary<string, string>
         {
             ["repos/acme/repo/issues/7"] = """{"number":7,"html_url":"https://github.com/acme/repo/issues/7","body":"depends_on: none","labels":[{"name":"task:planned"}]}""",
-            ["repos/acme/repo/issues/7/timeline?per_page=100"] = JsonSerializer.Serialize(timeline),
+            ["repos/acme/repo/issues/7/timeline?per_page=100"] = JsonSerializer.Serialize(new[] { firstPage, secondPage }),
             ["repos/acme/repo/pulls/9"] = $$"""{"number":9,"html_url":"https://github.com/acme/repo/pull/9","state":"open","draft":false,"merged":false,"head":{"sha":"{{new string('a', 40)}}"},"base":{"sha":"{{new string('b', 40)}}","ref":"master"},"merge_commit_sha":null}""",
             ["repos/acme/repo"] = """{"default_branch":"master"}"""
         });
@@ -133,6 +134,7 @@ public sealed class GitHubStateReaderTests
 
         Assert.Equal(9, snapshot.PullRequestNumber);
         Assert.Contains(process.Invocations, invocation => invocation.Arguments.Contains("--paginate"));
+        Assert.Contains(process.Invocations, invocation => invocation.Arguments.Contains("--slurp"));
     }
 
     private static string IssueOnlyJson => JsonSerializer.Serialize(new

@@ -215,7 +215,7 @@ public sealed class GhGitHubClient : IGitHubClient
         ProcessResult result;
         try
         {
-            var arguments = paginate ? new[] { "api", "--paginate", route } : ["api", route];
+            var arguments = paginate ? new[] { "api", "--paginate", "--slurp", route } : ["api", route];
             result = await _processInvoker.InvokeAsync(new ProcessInvocation(_ghExecutable,
                 arguments, "", _timeout), timeout.Token).ConfigureAwait(false);
         }
@@ -254,7 +254,11 @@ public sealed class GhGitHubClient : IGitHubClient
     private static string? FindAssociatedPullRequest(string timelineJson, string owner, string repository)
     {
         using var document = JsonDocument.Parse(timelineJson);
-        foreach (var item in document.RootElement.EnumerateArray())
+        var root = document.RootElement;
+        var items = root.EnumerateArray().SelectMany(page => page.ValueKind == JsonValueKind.Array
+            ? page.EnumerateArray().Select(item => item.Clone())
+            : [page.Clone()]);
+        foreach (var item in items)
         {
             if (OptionalString(item, "event") != "cross-referenced" || !item.TryGetProperty("source", out var source) ||
                 !source.TryGetProperty("issue", out var sourceIssue) || !sourceIssue.TryGetProperty("pull_request", out var pr)) continue;
