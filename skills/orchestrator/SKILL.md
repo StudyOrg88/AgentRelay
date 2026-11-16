@@ -77,14 +77,26 @@ agentrelay_merge:
   retry: <需要修复后重试的条件；永久不兼容时说明需先变更契约>
 ```
 
-只能在所有记录、review、验收证据、CI、分支保护和 PR 状态检查都成功，PR 仍开放且无冲突时，使用 Merge Bot 执行 `gh pr merge --squash`。合并后再写入合并证据并将 Issue 标记 `task:done`。
+只能在所有记录、review、验收证据、实际生效且适用于目标 base 分支的 required checks、分支保护和 PR 状态检查都满足要求，PR 仍开放且无冲突时，使用 Merge Bot 执行 `gh pr merge --squash`。每项 required check 必须成功并绑定当前 PR 的完整 HEAD SHA；其识别和验证遵循本节「分支保护与 CI 证据」规则。如果确认目标分支没有配置 required checks，不因 CI 缺失本身阻断，而应按变更类型和风险核验相应的项目验证证据。合并后再写入合并证据并将 Issue 标记 `task:done`。
 
 ### 分支保护与 CI 证据
 
-- 项目默认假设目标仓库分支未配置分支保护；正常验收按此假设继续，不要求查询保护 API，也不要求为该默认假设额外取证。仅当本次任务中出现针对精确目标仓库/分支的明确反证（例如有权限的 API 成功返回了保护规则，或仓库管理员指出该分支已启用保护）时，才暂停并按已确认规则核对 required status checks；有冲突时不得继续套用默认假设。API `403` 只是查询权限不足，既不是“已配置”的反证，也不能单独证明“未配置”，因此按项目默认假设继续，不把它作为 required checks 已核验的证据。Checks API 对 PR 当前 HEAD 的 CI 核验仍是独立门槛。
-- Checks API 可用于核对 required CI。若 Checks API 返回 `403`，允许改用 GitHub Actions API 查询相关 workflow run 与 jobs，但不得把该替代路径当作放宽门槛。每个 required job 必须属于该 PR 的 `pull_request` 事件，run 的 `head_sha` 必须与 PR 当前完整 HEAD SHA 精确相等，且 job/run 结论为 `success`。不得接受短 SHA、仅分支名匹配、其他事件的 run、旧提交结果、缺失 job 或非成功结论。若不能证明上述关联和完整性，fail closed，禁止合并。
+本节的 required CI 指 Branch Protection 与适用 Repository Rulesets 实际要求的 required checks；CI 工具是否存在与 required checks 是否配置是两个独立事实。
 
-任何门槛失败、格式错误、权限不足、网络错误或 API 失败都禁止合并；主控在 PR 写入结构化失败评论，保留 `task:review`。下一次人工调用 Skill 时读取失败评论并重新检查、重试。这里不是定时任务、Webhook 或自动唤醒。
+- **先确定要求，再检查结果。** 对规范身份已验证的目标仓库和 PR 实际 base 分支，分别读取 Branch Protection 与所有可能适用的 Repository Rulesets。确认规则读取完整、Rulesets 对该分支的适用性明确，并汇总所有实际生效规则要求的 required checks；不能只选取其中一条规则，也不能遗漏不同规则的叠加要求。按需要使用 Branch Protection、Rulesets、Checks API、Commit Status 等权威来源。
+- required checks 通过不能替代 Acceptance、独立 Reviewer 或与本次变更风险相符的项目验证证据；这些仍是彼此独立的合并门槛。
+- 无法读取 Branch Protection 或 Rulesets、权限不足、API `403`、`404` 语义不明确、无法确认 Ruleset 是否适用、查询不完整或结果矛盾时，暂停合并并按本技能的结构化失败格式报告。**不得把读取失败解释为“没有配置 required checks”。** Checks API 返回 0 条结果不等于目标分支没有 required checks；在规则集合已完整确定之前，空结果不能证明没有 required checks。
+- 只有成功读取并确认 Branch Protection 与适用 Rulesets 的完整规则后，才能进入“没有 required checks”分支。此时不因 Checks API 返回 0 条结果或仓库没有 GitHub Actions workflows 而自动阻断，也不要求临时创建 CI；但必须根据本次实际变更的交付物、范围和风险，明确需要哪些测试、契约、Reviewer、Acceptance 或集成证据，并核验这些证据确已取得。无 required checks 不等于测试通过，也不豁免任何项目验证要求；无 required checks 不能绕过 Reviewer、Acceptance 或现有 Merge Gate。必要证据缺失、失败、过期或无法验证时仍须阻断。
+- 如果存在 required checks，必须逐项核验完整集合。每一项都必须有成功结果，并能证明其对应当前 PR 的完整 HEAD SHA。失败、等待、仍在运行、缺少结果、只匹配旧 SHA、短 SHA、其他 PR/分支/事件结果，或无法确认检查集合完整性，均阻断合并。若 Checks API 返回 `403`，可尝试 GitHub Actions API 或其他权威状态来源，但替代来源必须证明同一 required check 的身份、当前完整 HEAD SHA 和成功结论；不能证明时 fail closed。替代来源仅用于原查询来源不可用或无法取得完整结果的情况；若权威来源已经明确返回 required check 失败、等待中、运行中或 SHA 不匹配，不得使用其他来源的成功结果覆盖该状态。替代来源必须证明对应同一项 required check，而非名称相似或用途不同的检查。
+- **合并前重新读取。** 在执行 Merge Bot 前，重新读取 PR 当前 HEAD 和 BASE、目标仓库身份、Branch Protection、适用 Rulesets 和 required checks 完整集合，并重新核验当前 HEAD 的 required-check 结果、Reviewer、Acceptance 及 PR 开放/可合并状态。HEAD 或 BASE 变化时，按现有绑定规则重新判断并获取失效证据；保护规则变化时，以最新完整规则重算门槛。任何状态变化、不确定性或证据缺失都暂停合并。
+
+### PowerShell 运行基线
+
+- Orchestrator 相关 PowerShell 命令与合约测试以 PowerShell 7 为基线，统一使用 `pwsh`；不假定存在 Windows PowerShell 5.1 或 `powershell.exe`。
+- 本 Skill 和对应合约测试应使用 `$PSScriptRoot`、`Join-Path`、`Resolve-Path` 等跨平台路径方式，不硬编码 Windows 盘符或假设分隔符、路径大小写规则。
+- Windows 与 Linux 的 PowerShell 7 测试必须分别实际运行并记录操作系统、PowerShell 版本、命令和结果。未实际执行的平台明确标为未验证，不得以另一平台结果代替。此要求不授权修改其他脚本，也不要求新增 CI 工作流。
+
+任何未能通过本节规定的权威来源或允许的替代来源完成验证的门槛失败、格式错误、权限不足、网络错误或 API 错误，都禁止合并。Branch Protection 或适用 Rulesets 无法完整读取时必须暂停；Checks 或 Commit Status 查询失败时，只有在本节允许的替代来源能够完整证明 required check 身份、当前完整 HEAD SHA、成功结论及检查集合完整性时，才可继续，否则禁止合并。替代来源仅用于原查询来源不可用或无法取得完整结果；权威来源已明确返回失败、等待、运行中或 SHA 不匹配时，不得以其他来源的成功结果覆盖。主控在 PR 写入结构化失败评论，保留 `task:review`。下一次人工调用 Skill 时读取失败评论并重新检查、重试。这里不是定时任务、Webhook 或自动唤醒。
 
 ## 边界
 
