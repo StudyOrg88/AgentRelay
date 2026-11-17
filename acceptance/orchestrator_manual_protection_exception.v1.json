@@ -1,0 +1,123 @@
+{
+  "schema_version": "acceptance/v1",
+  "task_id": "orchestrator_manual_protection_exception",
+  "reviewed_code_commit": "210c7f1304a920c05947a686ccdccdd2ae44c647",
+  "acceptance_base_commit": "7d48a0ee864cf9ccd7df282839c8a1b5512a1ba0",
+  "record_commit_parent": "210c7f1304a920c05947a686ccdccdd2ae44c647",
+  "items": [
+    {
+      "id": "manual_exception_state_matrix",
+      "status": "passed",
+      "merge_blocking": true,
+      "evidence_type": "command",
+      "accepted_evidence": [
+        "At 210c7f1304a920c05947a686ccdccdd2ae44c647, pwsh -NoProfile -File tests/test_orchestrator_contract.ps1 exited 0 and parsed the normative matrix including pause, scoped continuation, known-check blocking, and one normal GitHub merge attempt.",
+        "The matrix keeps protection_config and required_checks_config unknown under an approved exception; no runtime Merge Bot behavior is claimed."
+      ],
+      "rejected_evidence": [
+        "Treating an unknown protection or required-check configuration as absent or passed.",
+        "Allowing an unapproved exception, known failed check, or GitHub bypass."
+      ],
+      "owner_task": "orchestrator_manual_protection_exception"
+    },
+    {
+      "id": "approval_scope_and_audit",
+      "status": "passed",
+      "merge_blocking": true,
+      "evidence_type": "command",
+      "accepted_evidence": [
+        "At 210c7f1304a920c05947a686ccdccdd2ae44c647, both Orchestrator contract scripts exited 0 with the repository/base/PR/HEAD/BASE scope and audit rules present.",
+        "The policy does not require identity or Owner/Admin role verification and invalidates approval when scoped PR state changes."
+      ],
+      "rejected_evidence": [
+        "Claiming API or administrator confirmation when only the user conversation approved an exception.",
+        "Reusing an approval after repository, base, PR, HEAD, BASE, or PR open/closed state changes."
+      ],
+      "owner_task": "orchestrator_manual_protection_exception"
+    },
+    {
+      "id": "known_checks_and_existing_gates",
+      "status": "passed",
+      "merge_blocking": true,
+      "evidence_type": "command",
+      "accepted_evidence": [
+        "At 210c7f1304a920c05947a686ccdccdd2ae44c647, the decision-matrix and Acceptance contract scripts exited 0 with known non-success checks, Reviewer, Acceptance, and project evidence remaining blocking.",
+        "The policy does not infer required-check absence from an empty Checks API response or from the lack of CI."
+      ],
+      "rejected_evidence": [
+        "Manual approval or a green result from another source overriding a known failed required check.",
+        "Manual approval bypassing Reviewer, Acceptance, or necessary project evidence."
+      ],
+      "owner_task": "orchestrator_manual_protection_exception"
+    },
+    {
+      "id": "merge_attempt_persisted_and_head_locked",
+      "status": "passed",
+      "merge_blocking": true,
+      "evidence_type": "command",
+      "accepted_evidence": [
+        "At 210c7f1304a920c05947a686ccdccdd2ae44c647, static contract tests require a persisted/read-back started audit comment and a full current HEAD precondition; unsupported SHA locking pauses without fallback.",
+        "The current gh pr merge --help exposes --match-head-commit SHA; no merge operation was executed."
+      ],
+      "rejected_evidence": [
+        "Calling merge before persisting the attempt, omitting the full HEAD precondition, or bypassing GitHub restrictions."
+      ],
+      "owner_task": "orchestrator_manual_protection_exception"
+    },
+    {
+      "id": "merge_attempt_recovery_no_duplicate",
+      "status": "passed",
+      "merge_blocking": true,
+      "evidence_type": "command",
+      "accepted_evidence": [
+        "At 210c7f1304a920c05947a686ccdccdd2ae44c647, static contract tests require unresolved started attempts to remain non-retryable and require distinct merged/rejected outcomes with evidence."
+      ],
+      "rejected_evidence": [
+        "A new approval resetting an unresolved started attempt or a second merge call after an indeterminate result."
+      ],
+      "owner_task": "orchestrator_manual_protection_exception"
+    },
+    {
+      "id": "decision_matrix_static_contract",
+      "status": "passed",
+      "merge_blocking": true,
+      "evidence_type": "command",
+      "accepted_evidence": [
+        "At 210c7f1304a920c05947a686ccdccdd2ae44c647, both targeted contract scripts exited 0; the main test parsed unique scenario IDs and exact conditions/outcomes and rejected missing, reversed, duplicate, and contradictory mutations.",
+        "These are static Skill contract tests and do not execute Merge Bot runtime branches."
+      ],
+      "rejected_evidence": [
+        "Keyword-presence-only checks or claims of runtime Merge Bot coverage."
+      ],
+      "owner_task": "orchestrator_manual_protection_exception"
+    },
+    {
+      "id": "cross_platform_contract_tests",
+      "status": "pending",
+      "merge_blocking": true,
+      "evidence_type": "command",
+      "accepted_evidence": [
+        "Windows 10 Pro / PowerShell 7.6.10 at 210c7f1304a920c05947a686ccdccdd2ae44c647: both targeted tests passed; all 17 scripts were discovered and passed individually; git diff --check exited 0.",
+        "Ubuntu aarch64 / PowerShell 7 evidence is not yet available and must be added before this item can pass."
+      ],
+      "rejected_evidence": [
+        "Treating Windows results as Linux verification or reporting Linux passed without running it."
+      ],
+      "owner_task": "orchestrator_manual_protection_exception"
+    },
+    {
+      "id": "scoped_delivery_and_acceptance",
+      "status": "pending",
+      "merge_blocking": true,
+      "evidence_type": "artifact",
+      "accepted_evidence": [
+        "Implementation code commit 210c7f1304a920c05947a686ccdccdd2ae44c647 changes only the three approved Skill/contract-test files.",
+        "Independent Reviewer PASS bound to the code commit and final Acceptance v1 record are still pending."
+      ],
+      "rejected_evidence": [
+        "Changes outside the three approved implementation files or reuse/modification of prior Issue/PR history."
+      ],
+      "owner_task": "orchestrator_manual_protection_exception"
+    }
+  ]
+}
