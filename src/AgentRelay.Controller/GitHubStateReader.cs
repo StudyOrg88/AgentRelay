@@ -26,8 +26,31 @@ public sealed record GitHubStateSnapshot(
     bool Merged,
     string? MergeCommitSha)
 {
-    public TaskSnapshot ToTaskSnapshot() => new(IssueUrl, Labels, DependenciesReady, PullRequestEvidenceId);
+    public MergeReviewEvidence? Review { get; init; }
+
+    public TaskSnapshot ToTaskSnapshot() => new(IssueUrl, Labels, DependenciesReady, PullRequestEvidenceId)
+    {
+        PullRequestHeadSha = CurrentHeadSha,
+        PullRequestBaseSha = PullRequestBaseSha,
+        ReviewedHeadSha = Review?.ReviewedHeadSha,
+        ReviewedBaseSha = Review?.ReviewedBaseSha,
+        ReviewResult = Review?.Result
+    };
 }
+
+public sealed record MergeReviewEvidence(
+    string Result,
+    string ReviewedHeadSha,
+    string ReviewedCodeCommit,
+    string ReviewedBaseSha,
+    string AcceptanceBaseCommit,
+    string RecordCommitParent,
+    string Reviewer,
+    string SessionId,
+    DateTimeOffset ReviewedAt,
+    IReadOnlyList<string> Findings,
+    IReadOnlyList<string> Evidence,
+    string CommentAuthor);
 
 public sealed class GitHubStateReader(IGitHubClient client)
 {
@@ -89,8 +112,9 @@ public sealed class GitHubStateReader(IGitHubClient client)
             var baseRef = RequiredSafeGitRef(pr, "base_ref");
             var defaultBranch = RequiredSafeGitRef(pr, "default_branch");
             var mergeSha = merged ? RequiredFullSha(pr, "merge_commit_sha") : OptionalFullSha(pr, "merge_commit_sha");
-            return new(canonical, labels, dependenciesReady, number, prUrl, headSha, baseSha, baseRef,
-                defaultBranch, merged, mergeSha);
+            var review = ParseReview(pr);
+            return new GitHubStateSnapshot(canonical, labels, dependenciesReady, number, prUrl, headSha, baseSha, baseRef,
+                defaultBranch, merged, mergeSha) { Review = review };
         }
         catch (Exception exception) when (exception is not GitHubStateUnavailableException)
         {
@@ -132,6 +156,32 @@ public sealed class GitHubStateReader(IGitHubClient client)
         parent.TryGetProperty(name, out var value) && kinds.Contains(value.ValueKind)
             ? value
             : throw new FormatException($"Missing or invalid {name}.");
+
+    private static MergeReviewEvidence? ParseReview(JsonElement root)
+    {
+        if (!root.TryGetProperty("review", out var review) || review.ValueKind == JsonValueKind.Null) return null;
+        var result = RequiredString(review, "result");
+        var reviewedHead = RequiredFullSha(review, "reviewed_head_sha");
+        var reviewedCode = RequiredFullSha(review, "reviewed_code_commit");
+        var reviewedBase = RequiredFullSha(review, "reviewed_base_sha");
+        var acceptanceBase = RequiredFullSha(review, "acceptance_base_commit");
+        var recordParent = RequiredFullSha(review, "record_commit_parent");
+        var reviewer = RequiredString(review, "reviewer");
+        var sessionId = RequiredString(review, "session_id");
+        var reviewedAtText = RequiredString(review, "reviewed_at");
+        var reviewedAt = DateTimeOffset.TryParse(reviewedAtText, System.Globalization.CultureInfo.InvariantCulture,
+            System.Globalization.DateTimeStyles.RoundtripKind, out var parsedAt)
+            ? parsedAt
+            : throw new FormatException("Invalid reviewer timestamp.");
+        var findings = RequiredArray(review, "findings").EnumerateArray()
+            .Select(item => item.GetString() ?? throw new FormatException("Invalid reviewer finding." )).ToArray();
+        var evidence = RequiredArray(review, "evidence").EnumerateArray()
+            .Select(item => item.GetString() ?? throw new FormatException("Invalid reviewer evidence.")).ToArray();
+        var commentAuthor = RequiredString(review, "comment_author");
+        if (result is not ("PASS" or "CHANGES_REQUESTED")) throw new FormatException("Invalid reviewer result.");
+        return new(result, reviewedHead, reviewedCode, reviewedBase, acceptanceBase, recordParent, reviewer,
+            sessionId, reviewedAt, findings, evidence, commentAuthor);
+    }
 }
 
 public sealed class GhGitHubClient : IGitHubClient
@@ -173,6 +223,8 @@ public sealed class GhGitHubClient : IGitHubClient
             var baseInfo = RequiredObject(pr, "base");
             var headInfo = RequiredObject(pr, "head");
             var pullNumber = RequiredInt(pr, "number");
+            var reviewJson = await ReadApiAsync($"repos/{owner}/{repository}/issues/{pullNumber}/comments", cancellationToken, paginate: true).ConfigureAwait(false);
+            var review = FindReview(reviewJson);
             pullRequest = new
             {
                 number = pullNumber,
@@ -185,7 +237,8 @@ public sealed class GhGitHubClient : IGitHubClient
                 base_sha = RequiredString(baseInfo, "sha"),
                 base_ref = RequiredString(baseInfo, "ref"),
                 default_branch = RequiredString(repoDoc.RootElement, "default_branch"),
-                merge_commit_sha = OptionalString(pr, "merge_commit_sha")
+                merge_commit_sha = OptionalString(pr, "merge_commit_sha"),
+                review
             };
         }
 
@@ -250,6 +303,104 @@ public sealed class GhGitHubClient : IGitHubClient
         }
         return states.ToArray();
     }
+
+    private static object? FindReview(string commentsJson)
+    {
+        using var document = JsonDocument.Parse(commentsJson);
+        object? latest = null;
+        foreach (var page in document.RootElement.EnumerateArray())
+        {
+            if (page.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var comment in page.EnumerateArray()) latest = ParseReviewComment(comment) ?? latest;
+            }
+            else latest = ParseReviewComment(page) ?? latest;
+        }
+        return latest;
+    }
+
+    private static object? ParseReviewComment(JsonElement comment)
+    {
+        if (OptionalString(comment, "body") is not { } body || !body.Contains("agentrelay_review:", StringComparison.Ordinal)) return null;
+        var markers = Regex.Matches(body, @"(?m)^agentrelay_review:\s*$", RegexOptions.CultureInvariant);
+        var fence = Regex.Match(body, @"(?ms)^```yaml[ \t]*\r?\nagentrelay_review:[ \t]*\r?\n(?<block>.*?)\r?\n```[ \t]*");
+        if (markers.Count != 1 || !fence.Success) return InvalidReview();
+
+        var scalarFields = new Dictionary<string, string>(StringComparer.Ordinal);
+        var evidence = new List<string>();
+        var findingsHaveItems = false;
+        string? activeList = null;
+        foreach (var line in fence.Groups["block"].Value.Split("\n", StringSplitOptions.None))
+        {
+            var normalizedLine = line.TrimEnd('\r');
+            if (string.IsNullOrWhiteSpace(normalizedLine)) continue;
+            var field = Regex.Match(normalizedLine, @"\A  (?<key>[a-z_]+):(?:[ \t]*(?<value>.*))?\z", RegexOptions.CultureInvariant);
+            if (field.Success)
+            {
+                var key = field.Groups["key"].Value;
+                if (!ReviewFields.Contains(key) || scalarFields.ContainsKey(key)) return InvalidReview();
+                var value = field.Groups["value"].Success ? field.Groups["value"].Value.Trim() : "";
+                scalarFields.Add(key, value.Trim('"', '\''));
+                activeList = key is "findings" or "evidence" ? key : null;
+                continue;
+            }
+
+            if (normalizedLine.StartsWith("    - ", StringComparison.Ordinal) && activeList is "findings" or "evidence")
+            {
+                var item = normalizedLine[6..].Trim();
+                if (item.Length == 0) return InvalidReview();
+                if (activeList == "evidence") evidence.Add(item.Trim('"', '\''));
+                else findingsHaveItems = true;
+                continue;
+            }
+            if (normalizedLine.StartsWith("      ", StringComparison.Ordinal) && activeList is "findings" or "evidence") continue;
+            return InvalidReview();
+        }
+
+        if (ReviewFields.Any(key => !scalarFields.ContainsKey(key))) return InvalidReview();
+        var result = scalarFields["result"];
+        if (result is not ("PASS" or "CHANGES_REQUESTED")) return InvalidReview();
+        var findingsEmpty = scalarFields["findings"] == "[]";
+        if (findingsEmpty && findingsHaveItems) return InvalidReview();
+        if (!findingsEmpty && scalarFields["findings"].Length != 0) return InvalidReview();
+        if (!new[] { "reviewed_head_sha", "reviewed_code_commit", "reviewed_base_sha", "acceptance_base_commit", "record_commit_parent" }
+            .All(key => Regex.IsMatch(scalarFields[key], @"\A[0-9a-f]{40}\z", RegexOptions.CultureInvariant))) return InvalidReview();
+
+        var author = comment.TryGetProperty("user", out var user) && user.ValueKind == JsonValueKind.Object
+            ? OptionalString(user, "login") : null;
+        if (author is null || string.IsNullOrWhiteSpace(scalarFields["reviewer"]) ||
+            string.IsNullOrWhiteSpace(scalarFields["session_id"]) ||
+            !DateTimeOffset.TryParse(scalarFields["reviewed_at"], System.Globalization.CultureInfo.InvariantCulture,
+                System.Globalization.DateTimeStyles.RoundtripKind, out _)) return InvalidReview();
+        return new
+        {
+            result,
+            reviewed_head_sha = scalarFields["reviewed_head_sha"],
+            reviewed_code_commit = scalarFields["reviewed_code_commit"],
+            reviewed_base_sha = scalarFields["reviewed_base_sha"],
+            acceptance_base_commit = scalarFields["acceptance_base_commit"],
+            record_commit_parent = scalarFields["record_commit_parent"],
+            reviewer = scalarFields["reviewer"],
+            session_id = scalarFields["session_id"],
+            reviewed_at = scalarFields["reviewed_at"],
+            findings = findingsEmpty ? Array.Empty<string>() : new[] { "structured findings present" },
+            evidence = evidence.ToArray(),
+            comment_author = author
+        };
+    }
+
+    private static readonly HashSet<string> ReviewFields = new(StringComparer.Ordinal)
+    {
+        "result", "reviewed_head_sha", "reviewed_code_commit", "reviewed_base_sha", "acceptance_base_commit",
+        "record_commit_parent", "reviewer", "session_id", "reviewed_at", "findings", "evidence"
+    };
+
+    private static object InvalidReview() => new
+    {
+        result = "INVALID", reviewed_head_sha = "", reviewed_code_commit = "", reviewed_base_sha = "",
+        acceptance_base_commit = "", record_commit_parent = "", reviewer = "", session_id = "", reviewed_at = "",
+        findings = Array.Empty<string>(), evidence = Array.Empty<string>(), comment_author = ""
+    };
 
     private static string? FindAssociatedPullRequest(string timelineJson, string owner, string repository)
     {

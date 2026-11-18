@@ -3,6 +3,7 @@ namespace AgentRelay.Core;
 public enum TaskAction
 {
     Worker,
+    Reviewer,
     NeedsInput
 }
 
@@ -10,7 +11,14 @@ public sealed record TaskSnapshot(
     string IssueUrl,
     IReadOnlyList<string> Labels,
     bool DependenciesReady,
-    string? PullRequestEvidenceId);
+    string? PullRequestEvidenceId)
+{
+    public string? PullRequestHeadSha { get; init; }
+    public string? PullRequestBaseSha { get; init; }
+    public string? ReviewedHeadSha { get; init; }
+    public string? ReviewedBaseSha { get; init; }
+    public string? ReviewResult { get; init; }
+}
 
 public sealed record LifecycleDecision(TaskAction Action, string Reason);
 
@@ -40,6 +48,22 @@ public static class TaskLifecycle
                 ? "Resume the in-progress task; no matching PR exists yet."
                 : "Resume the in-progress task using its matching PR evidence.");
 
+        if (lifecycleLabels[0] == "task:review")
+        {
+            var reviewMatches = IsFullSha(snapshot.PullRequestHeadSha) &&
+                IsFullSha(snapshot.PullRequestBaseSha) &&
+                StringComparer.Ordinal.Equals(snapshot.PullRequestHeadSha, snapshot.ReviewedHeadSha) &&
+                StringComparer.Ordinal.Equals(snapshot.PullRequestBaseSha, snapshot.ReviewedBaseSha);
+            if (!reviewMatches)
+                return new(TaskAction.Reviewer, "Pull request head or base changed; obtain a new independent review.");
+            return snapshot.ReviewResult is "PASS" or "CHANGES_REQUESTED"
+                ? new(TaskAction.NeedsInput, "A current head/base-bound review is available for Orchestrator finding routing.")
+                : new(TaskAction.Reviewer, "A valid current review result is unavailable.");
+        }
+
         return new(TaskAction.NeedsInput, "Issue is not eligible for initial Worker routing.");
     }
+
+    private static bool IsFullSha(string? value) => value is not null &&
+        System.Text.RegularExpressions.Regex.IsMatch(value, @"\A[0-9a-f]{40}\z", System.Text.RegularExpressions.RegexOptions.CultureInvariant);
 }
