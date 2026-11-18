@@ -23,6 +23,13 @@ public sealed class BootstrapProbeTests
         yield return [ValidEvidence() with { ReviewerIdentity = "gate-app" }, "identities_not_isolated"];
         yield return [ValidEvidence() with { GateCheckApp = "wrong-app" }, "gate_app_mismatch"];
         yield return [ValidEvidence() with { MergeQueueEnabled = true }, "merge_queue_unsupported"];
+        yield return [ValidEvidence() with { LeaseCapabilityKnown = false }, "lease_capability_unknown"];
+        yield return [ValidEvidence() with { LeaseCreateUsesNonForceCas = false }, "lease_non_force_cas_unsupported"];
+        yield return [ValidEvidence() with { LeaseCompetitionSingleWinner = false }, "lease_competition_unsupported"];
+        yield return [ValidEvidence() with { GateTargetKnown = false }, "gate_target_unknown"];
+        yield return [ValidEvidence() with { GateTargetCommit = "abc123" }, "gate_target_invalid"];
+        yield return [ValidEvidence() with { GateTargetsRequiredCommit = false }, "gate_target_mismatch"];
+        yield return [ValidEvidence() with { GateTargetAssociatedWithReviewedHead = false }, "gate_target_unassociated"];
     }
 
     [Theory]
@@ -57,7 +64,14 @@ public sealed class BootstrapProbeTests
         MergeIdentity: "merge-app",
         GateCheckApp: "gate-app",
         ExpectedChecks: ["build"],
-        MergeQueueEnabled: false);
+        MergeQueueEnabled: false,
+        LeaseCapabilityKnown: true,
+        LeaseCreateUsesNonForceCas: true,
+        LeaseCompetitionSingleWinner: true,
+        GateTargetKnown: true,
+        GateTargetCommit: new string('a', 40),
+        GateTargetsRequiredCommit: true,
+        GateTargetAssociatedWithReviewedHead: true);
 
     private sealed class FakeGitHubApi : IGitHubApi
     {

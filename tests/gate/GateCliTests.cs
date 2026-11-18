@@ -52,7 +52,7 @@ public sealed class GateCliTests
     private sealed class NoopApi : IGitHubApi
     {
         public Task<BootstrapEvidence> ReadBootstrapEvidenceAsync(BootstrapProbeRequest request, CancellationToken cancellationToken)
-            => Task.FromResult(new BootstrapEvidence(true, false, false, false, "reviewer", "gate", "merge", "gate", ["build"], false));
+            => Task.FromResult(new BootstrapEvidence(true, false, false, false, "reviewer", "gate", "merge", "gate", ["build"], false, true, true, true, true, new string('a', 40), true, true));
     }
 
     private sealed class ThrowingApi(string message) : IGitHubApi

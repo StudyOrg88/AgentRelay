@@ -20,7 +20,14 @@ public sealed record BootstrapEvidence(
     string MergeIdentity,
     string GateCheckApp,
     IReadOnlyList<string> ExpectedChecks,
-    bool MergeQueueEnabled);
+    bool MergeQueueEnabled,
+    bool LeaseCapabilityKnown,
+    bool LeaseCreateUsesNonForceCas,
+    bool LeaseCompetitionSingleWinner,
+    bool GateTargetKnown,
+    string? GateTargetCommit,
+    bool GateTargetsRequiredCommit,
+    bool GateTargetAssociatedWithReviewedHead);
 
 public sealed record BootstrapProbeResult(ProbeStatus Status, IReadOnlyList<string> Blockers, string Summary);
 

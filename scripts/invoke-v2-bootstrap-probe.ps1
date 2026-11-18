@@ -47,6 +47,9 @@ if (-not $token) { throw "$tokenName is not configured." }
 $process = [System.Diagnostics.ProcessStartInfo]::new('dotnet')
 $process.UseShellExecute = $false
 foreach ($argument in $arguments) { [void]$process.ArgumentList.Add($argument) }
+$inheritedRoleTokens = @($process.Environment.Keys | Where-Object { $_.StartsWith('AGENTRELAY_TOKEN_', [System.StringComparison]::OrdinalIgnoreCase) })
+foreach ($name in $inheritedRoleTokens) { [void]$process.Environment.Remove($name) }
+$process.Environment[$tokenName] = $token
 $process.Environment['GH_TOKEN'] = $token
 $child = [System.Diagnostics.Process]::Start($process)
 $child.WaitForExit()

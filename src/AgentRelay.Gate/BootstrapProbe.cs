@@ -31,6 +31,19 @@ public sealed class BootstrapProbe
             !StringComparer.Ordinal.Equals(evidence.MergeIdentity, request.MergeApp)) blockers.Add("identity_mismatch");
         if (!StringComparer.Ordinal.Equals(evidence.GateCheckApp, request.GateApp)) blockers.Add("gate_app_mismatch");
         if (evidence.MergeQueueEnabled) blockers.Add("merge_queue_unsupported");
+        if (!evidence.LeaseCapabilityKnown) blockers.Add("lease_capability_unknown");
+        else
+        {
+            if (!evidence.LeaseCreateUsesNonForceCas) blockers.Add("lease_non_force_cas_unsupported");
+            if (!evidence.LeaseCompetitionSingleWinner) blockers.Add("lease_competition_unsupported");
+        }
+        if (!evidence.GateTargetKnown) blockers.Add("gate_target_unknown");
+        else
+        {
+            if (evidence.GateTargetCommit is null || evidence.GateTargetCommit.Length != 40 || !evidence.GateTargetCommit.All(Uri.IsHexDigit)) blockers.Add("gate_target_invalid");
+            if (!evidence.GateTargetsRequiredCommit) blockers.Add("gate_target_mismatch");
+            if (!evidence.GateTargetAssociatedWithReviewedHead) blockers.Add("gate_target_unassociated");
+        }
 
         return blockers.Count == 0
             ? new BootstrapProbeResult(ProbeStatus.Ready, [], "all required bootstrap evidence is present")
