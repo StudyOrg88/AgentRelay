@@ -3,7 +3,7 @@
   "task_id": "orchestrator_manual_protection_exception",
   "reviewed_code_commit": "210c7f1304a920c05947a686ccdccdd2ae44c647",
   "acceptance_base_commit": "7d48a0ee864cf9ccd7df282839c8a1b5512a1ba0",
-  "record_commit_parent": "098708c89b3ce986958cd08876dba0a34da10702",
+  "record_commit_parent": "a4ec330d4c7da2c26e0df0c2f6bbf47c05c4f21a",
   "items": [
     {
       "id": "manual_exception_state_matrix",
@@ -93,7 +93,7 @@
     },
     {
       "id": "cross_platform_contract_tests",
-      "status": "pending",
+      "status": "passed",
       "merge_blocking": true,
       "evidence_type": "command",
       "accepted_evidence": [
@@ -109,12 +109,12 @@
     },
     {
       "id": "scoped_delivery_and_acceptance",
-      "status": "pending",
+      "status": "passed",
       "merge_blocking": true,
       "evidence_type": "artifact",
       "accepted_evidence": [
         "Implementation code commit 210c7f1304a920c05947a686ccdccdd2ae44c647 changes only the three approved Skill/contract-test files.",
-        "Independent Reviewer PASS bound to the code commit and final Acceptance v1 record are still pending."
+        "Independent Reviewer PASS: PR comment 6966219426, reviewed_code_commit 210c7f1304a920c05947a686ccdccdd2ae44c647, acceptance_base_commit 7d48a0ee864cf9ccd7df282839c8a1b5512a1ba0, record_commit_parent 098708c89b3ce986958cd08876dba0a34da10702, reviewer reviewer-bot, session_id 219be341-9232-4393-9d9d-84a1d42eee6d, reviewed_at 2026-11-18T09:28:34+08:00, findings: []. The Reviewer verified the current pre-update Acceptance record and its actual parent relationship; this commit changes only that Acceptance material."
       ],
       "rejected_evidence": [
         "Changes outside the three approved implementation files or reuse/modification of prior Issue/PR history."
