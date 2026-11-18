@@ -3,7 +3,7 @@
   "task_id": "orchestrator_manual_protection_exception",
   "reviewed_code_commit": "f439cdf01a051130b5f54beca9e032b640f82d72",
   "acceptance_base_commit": "7d48a0ee864cf9ccd7df282839c8a1b5512a1ba0",
-  "record_commit_parent": "f439cdf01a051130b5f54beca9e032b640f82d72",
+  "record_commit_parent": "473e99db12dd1c38ed6182b9ac982cd872d1e074",
   "items": [
     {
       "id": "manual_exception_state_matrix",
@@ -109,13 +109,13 @@
     },
     {
       "id": "scoped_delivery_and_acceptance",
-      "status": "pending",
+      "status": "passed",
       "merge_blocking": true,
       "evidence_type": "artifact",
       "accepted_evidence": [
         "Implementation code commit 210c7f1304a920c05947a686ccdccdd2ae44c647 changes only the three approved Skill/contract-test files.",
         "Review baseline commit f439cdf01a051130b5f54beca9e032b640f82d72 preserves implementation code commit 210c7f1304a920c05947a686ccdccdd2ae44c647 and additionally contains only the separately approved audit-plan restoration plus removal of its single extra blank line at EOF; no other plan text or implementation code changed.",
-        "Independent Reviewer PASS for the new reviewed_code_commit f439cdf01a051130b5f54beca9e032b640f82d72 is pending; prior review comments cover older baselines and do not satisfy this new baseline."
+        "Independent Reviewer PASS: PR comment 6966627140, reviewed_code_commit f439cdf01a051130b5f54beca9e032b640f82d72, acceptance_base_commit 7d48a0ee864cf9ccd7df282839c8a1b5512a1ba0, record_commit_parent f439cdf01a051130b5f54beca9e032b640f82d72, reviewer reviewer-bot, session_id 3bb62921-bdd7-4196-9191-bfec698502b4, reviewed_at 2026-11-18T09:52:25+08:00, findings: []. The review verified the approved plan EOF normalization, complete BASE-to-baseline diff-check, scoped paths, current Acceptance bindings, and both targeted contract tests."
       ],
       "rejected_evidence": [
         "Changes outside the three approved implementation files or reuse/modification of prior Issue/PR history."
