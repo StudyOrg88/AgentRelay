@@ -1,0 +1,126 @@
+{
+  "schema_version": "acceptance/v1",
+  "task_id": "orchestrator_manual_protection_exception",
+  "reviewed_code_commit": "f439cdf01a051130b5f54beca9e032b640f82d72",
+  "acceptance_base_commit": "7d48a0ee864cf9ccd7df282839c8a1b5512a1ba0",
+  "record_commit_parent": "473e99db12dd1c38ed6182b9ac982cd872d1e074",
+  "items": [
+    {
+      "id": "manual_exception_state_matrix",
+      "status": "passed",
+      "merge_blocking": true,
+      "evidence_type": "command",
+      "accepted_evidence": [
+        "At 210c7f1304a920c05947a686ccdccdd2ae44c647, pwsh -NoProfile -File tests/test_orchestrator_contract.ps1 exited 0 and parsed the normative matrix including pause, scoped continuation, known-check blocking, and one normal GitHub merge attempt.",
+        "The matrix keeps protection_config and required_checks_config unknown under an approved exception; no runtime Merge Bot behavior is claimed."
+      ],
+      "rejected_evidence": [
+        "Treating an unknown protection or required-check configuration as absent or passed.",
+        "Allowing an unapproved exception, known failed check, or GitHub bypass."
+      ],
+      "owner_task": "orchestrator_manual_protection_exception"
+    },
+    {
+      "id": "approval_scope_and_audit",
+      "status": "passed",
+      "merge_blocking": true,
+      "evidence_type": "command",
+      "accepted_evidence": [
+        "At 210c7f1304a920c05947a686ccdccdd2ae44c647, both Orchestrator contract scripts exited 0 with the repository/base/PR/HEAD/BASE scope and audit rules present.",
+        "The policy does not require identity or Owner/Admin role verification and invalidates approval when scoped PR state changes."
+      ],
+      "rejected_evidence": [
+        "Claiming API or administrator confirmation when only the user conversation approved an exception.",
+        "Reusing an approval after repository, base, PR, HEAD, BASE, or PR open/closed state changes."
+      ],
+      "owner_task": "orchestrator_manual_protection_exception"
+    },
+    {
+      "id": "known_checks_and_existing_gates",
+      "status": "passed",
+      "merge_blocking": true,
+      "evidence_type": "command",
+      "accepted_evidence": [
+        "At 210c7f1304a920c05947a686ccdccdd2ae44c647, the decision-matrix and Acceptance contract scripts exited 0 with known non-success checks, Reviewer, Acceptance, and project evidence remaining blocking.",
+        "The policy does not infer required-check absence from an empty Checks API response or from the lack of CI."
+      ],
+      "rejected_evidence": [
+        "Manual approval or a green result from another source overriding a known failed required check.",
+        "Manual approval bypassing Reviewer, Acceptance, or necessary project evidence."
+      ],
+      "owner_task": "orchestrator_manual_protection_exception"
+    },
+    {
+      "id": "merge_attempt_persisted_and_head_locked",
+      "status": "passed",
+      "merge_blocking": true,
+      "evidence_type": "command",
+      "accepted_evidence": [
+        "At 210c7f1304a920c05947a686ccdccdd2ae44c647, static contract tests require a persisted/read-back started audit comment and a full current HEAD precondition; unsupported SHA locking pauses without fallback.",
+        "The current gh pr merge --help exposes --match-head-commit SHA; no merge operation was executed."
+      ],
+      "rejected_evidence": [
+        "Calling merge before persisting the attempt, omitting the full HEAD precondition, or bypassing GitHub restrictions."
+      ],
+      "owner_task": "orchestrator_manual_protection_exception"
+    },
+    {
+      "id": "merge_attempt_recovery_no_duplicate",
+      "status": "passed",
+      "merge_blocking": true,
+      "evidence_type": "command",
+      "accepted_evidence": [
+        "At 210c7f1304a920c05947a686ccdccdd2ae44c647, static contract tests require unresolved started attempts to remain non-retryable and require distinct merged/rejected outcomes with evidence."
+      ],
+      "rejected_evidence": [
+        "A new approval resetting an unresolved started attempt or a second merge call after an indeterminate result."
+      ],
+      "owner_task": "orchestrator_manual_protection_exception"
+    },
+    {
+      "id": "decision_matrix_static_contract",
+      "status": "passed",
+      "merge_blocking": true,
+      "evidence_type": "command",
+      "accepted_evidence": [
+        "At 210c7f1304a920c05947a686ccdccdd2ae44c647, both targeted contract scripts exited 0; the main test parsed unique scenario IDs and exact conditions/outcomes and rejected missing, reversed, duplicate, and contradictory mutations.",
+        "These are static Skill contract tests and do not execute Merge Bot runtime branches."
+      ],
+      "rejected_evidence": [
+        "Keyword-presence-only checks or claims of runtime Merge Bot coverage."
+      ],
+      "owner_task": "orchestrator_manual_protection_exception"
+    },
+    {
+      "id": "cross_platform_contract_tests",
+      "status": "passed",
+      "merge_blocking": true,
+      "evidence_type": "command",
+      "accepted_evidence": [
+        "Windows 10 Pro / PowerShell 7.6.10 at 210c7f1304a920c05947a686ccdccdd2ae44c647: both targeted tests passed; all 17 scripts were discovered and passed individually; git diff --check exited 0.",
+        "approved_platform_substitution: per explicit user approval recorded in PR comment 6955678792, verification ran on Ubuntu 26.04.1 LTS under WSL2, Linux x86_64 (not aarch64), with PowerShell 7.6.10 installed from the official powershell-7.6.10-linux-x64.tar.gz archive; archive SHA-256 E261CABC91C78A9AFE8D1E5F24731AB0D38204735AB2EC94B0AF55102652E10D.",
+        "On a detached worktree at exact PR HEAD 3d767d595b03d9992748dc5a1bbd46a4238bcde6: tests/test_orchestrator_contract.ps1 exited 0; tests/test_orchestrator_acceptance_contract.ps1 exited 0; exactly 17 tests/*.ps1 scripts were discovered and each exited 0 individually; git diff --check 7d48a0ee864cf9ccd7df282839c8a1b5512a1ba0 3d767d595b03d9992748dc5a1bbd46a4238bcde6 exited 0.",
+        "Environment limitation: the minimal WSL image lacks ICU; PowerShell tests were run with DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1. This is substitute-platform evidence for Ubuntu x86_64 WSL2, not Ubuntu aarch64 evidence."
+      ],
+      "rejected_evidence": [
+        "Representing the approved Ubuntu 26.04.1 WSL2 x86_64 substitute as aarch64 evidence, omitting the DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1 limitation, or treating Windows results as Linux verification."
+      ],
+      "owner_task": "orchestrator_manual_protection_exception"
+    },
+    {
+      "id": "scoped_delivery_and_acceptance",
+      "status": "passed",
+      "merge_blocking": true,
+      "evidence_type": "artifact",
+      "accepted_evidence": [
+        "Implementation code commit 210c7f1304a920c05947a686ccdccdd2ae44c647 changes only the three approved Skill/contract-test files.",
+        "Review baseline commit f439cdf01a051130b5f54beca9e032b640f82d72 preserves implementation code commit 210c7f1304a920c05947a686ccdccdd2ae44c647 and additionally contains only the separately approved audit-plan restoration plus removal of its single extra blank line at EOF; no other plan text or implementation code changed.",
+        "Independent Reviewer PASS: PR comment 6966627140, reviewed_code_commit f439cdf01a051130b5f54beca9e032b640f82d72, acceptance_base_commit 7d48a0ee864cf9ccd7df282839c8a1b5512a1ba0, record_commit_parent f439cdf01a051130b5f54beca9e032b640f82d72, reviewer reviewer-bot, session_id 3bb62921-bdd7-4196-9191-bfec698502b4, reviewed_at 2026-11-18T09:52:25+08:00, findings: []. The review verified the approved plan EOF normalization, complete BASE-to-baseline diff-check, scoped paths, current Acceptance bindings, and both targeted contract tests."
+      ],
+      "rejected_evidence": [
+        "Changes outside the three approved implementation files or reuse/modification of prior Issue/PR history."
+      ],
+      "owner_task": "orchestrator_manual_protection_exception"
+    }
+  ]
+}

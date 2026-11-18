@@ -27,6 +27,17 @@ foreach ($phrase in @(
     'Branch Protection',
     'Repository Rulesets',
     '无 required checks 不能绕过 Reviewer、Acceptance 或现有 Merge Gate',
+    'protection_config = unknown',
+    'manual_exception = approved',
+    'required_checks_config = unknown',
+    '已知 required check',
+    'attempt_id',
+    'status: started',
+    'status = rejected',
+    'status = merged',
+    'merge_commit_sha',
+    '新批准不能重置未解决的 started',
+    '不支持该前置条件，必须暂停',
     'required checks 通过不能替代 Acceptance',
     '必要证据缺失',
     '当前 PR 的完整 HEAD SHA',
@@ -79,7 +90,9 @@ foreach ($line in ($matrixMatch.Groups['body'].Value -split "`r?`n")) {
 foreach ($scenario in @(
     @{ Id = 'no-required-checks-evidence-complete'; Outcome = 'PASS_THIS_GATE'; Facts = 'Branch Protection 与适用 Rulesets 已完整确认无 required checks，且本次所需项目验证证据完整' },
     @{ Id = 'no-required-checks-evidence-incomplete'; Outcome = 'BLOCK'; Facts = '已确认无 required checks，但本次必要项目验证证据缺失、失败、过期或无法验证' },
-    @{ Id = 'acceptance-review-gate-incomplete'; Outcome = 'BLOCK'; Facts = 'Acceptance、独立 Reviewer 或其他现有 Merge Gate 未满足，不因 required checks 通过或缺失而豁免' }
+    @{ Id = 'acceptance-review-gate-incomplete'; Outcome = 'BLOCK'; Facts = 'Acceptance、独立 Reviewer 或其他现有 Merge Gate 未满足，不因 required checks 通过或缺失而豁免' },
+    @{ Id = 'manual-approval-other-gates-incomplete'; Outcome = 'BLOCK'; Facts = '人工批准有效但 Reviewer、Acceptance、项目验证或其他 Merge Gate 未满足' },
+    @{ Id = 'manual-approval-known-check-failure'; Outcome = 'BLOCK'; Facts = '已知 required check 失败、等待中、运行中、缺失或 SHA 不匹配' }
 )) {
     $matches = @($matrixRows | Where-Object Id -CEQ $scenario.Id)
     if ($matches.Count -ne 1 -or $matches[0].Outcome -cne $scenario.Outcome -or $matches[0].Facts -cne $scenario.Facts) {
@@ -87,6 +100,12 @@ foreach ($scenario in @(
     }
 }
 if ($matrixRows.Count -ne @($matrixRows | Group-Object Id).Count) { throw 'Decision matrix contains conflicting duplicate scenario IDs.' }
+if (@($matrixRows | Where-Object Id -CEQ 'manual-approval-other-gates-complete').Count -ne 1) {
+    throw 'Manual approval must have exactly one explicitly scoped success row.'
+}
+if (@($matrixRows | Where-Object Id -CEQ 'merge-attempt-recovery-no-retry').Count -ne 1) {
+    throw 'Merge-attempt recovery must have exactly one no-retry row.'
+}
 if ($skill -notmatch [regex]::Escape('本矩阵是唯一规范判定来源；说明性正文不得覆盖或改变矩阵结果')) {
     throw 'Acceptance safeguards must be part of the normative decision matrix.'
 }
