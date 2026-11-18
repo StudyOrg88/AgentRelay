@@ -3,7 +3,7 @@
   "task_id": "orchestrator_manual_protection_exception",
   "reviewed_code_commit": "210c7f1304a920c05947a686ccdccdd2ae44c647",
   "acceptance_base_commit": "7d48a0ee864cf9ccd7df282839c8a1b5512a1ba0",
-  "record_commit_parent": "210c7f1304a920c05947a686ccdccdd2ae44c647",
+  "record_commit_parent": "098708c89b3ce986958cd08876dba0a34da10702",
   "items": [
     {
       "id": "manual_exception_state_matrix",
@@ -98,10 +98,12 @@
       "evidence_type": "command",
       "accepted_evidence": [
         "Windows 10 Pro / PowerShell 7.6.10 at 210c7f1304a920c05947a686ccdccdd2ae44c647: both targeted tests passed; all 17 scripts were discovered and passed individually; git diff --check exited 0.",
-        "Ubuntu aarch64 / PowerShell 7 evidence is not yet available and must be added before this item can pass."
+        "approved_platform_substitution: per explicit user approval recorded in PR comment 6955678792, verification ran on Ubuntu 26.04.1 LTS under WSL2, Linux x86_64 (not aarch64), with PowerShell 7.6.10 installed from the official powershell-7.6.10-linux-x64.tar.gz archive; archive SHA-256 E261CABC91C78A9AFE8D1E5F24731AB0D38204735AB2EC94B0AF55102652E10D.",
+        "On a detached worktree at exact PR HEAD 3d767d595b03d9992748dc5a1bbd46a4238bcde6: tests/test_orchestrator_contract.ps1 exited 0; tests/test_orchestrator_acceptance_contract.ps1 exited 0; exactly 17 tests/*.ps1 scripts were discovered and each exited 0 individually; git diff --check 7d48a0ee864cf9ccd7df282839c8a1b5512a1ba0 3d767d595b03d9992748dc5a1bbd46a4238bcde6 exited 0.",
+        "Environment limitation: the minimal WSL image lacks ICU; PowerShell tests were run with DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1. This is substitute-platform evidence for Ubuntu x86_64 WSL2, not Ubuntu aarch64 evidence."
       ],
       "rejected_evidence": [
-        "Treating Windows results as Linux verification or reporting Linux passed without running it."
+        "Representing the approved Ubuntu 26.04.1 WSL2 x86_64 substitute as aarch64 evidence, omitting the DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1 limitation, or treating Windows results as Linux verification."
       ],
       "owner_task": "orchestrator_manual_protection_exception"
     },
