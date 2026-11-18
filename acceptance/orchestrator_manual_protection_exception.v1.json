@@ -1,9 +1,9 @@
 {
   "schema_version": "acceptance/v1",
   "task_id": "orchestrator_manual_protection_exception",
-  "reviewed_code_commit": "098708c89b3ce986958cd08876dba0a34da10702",
+  "reviewed_code_commit": "f439cdf01a051130b5f54beca9e032b640f82d72",
   "acceptance_base_commit": "7d48a0ee864cf9ccd7df282839c8a1b5512a1ba0",
-  "record_commit_parent": "246251fb9935b5cd6b9758c0808ec8a37e2fb9b5",
+  "record_commit_parent": "f439cdf01a051130b5f54beca9e032b640f82d72",
   "items": [
     {
       "id": "manual_exception_state_matrix",
@@ -114,8 +114,8 @@
       "evidence_type": "artifact",
       "accepted_evidence": [
         "Implementation code commit 210c7f1304a920c05947a686ccdccdd2ae44c647 changes only the three approved Skill/contract-test files.",
-        "Review baseline commit 098708c89b3ce986958cd08876dba0a34da10702 includes the implementation ancestry plus the separately approved, unchanged audit-plan restoration at docs/superpowers/plans/2026-11-17-orchestrator-manual-protection-exception-plan.md; it does not add implementation changes.",
-        "Independent Reviewer PASS for the new reviewed_code_commit 098708c89b3ce986958cd08876dba0a34da10702 is pending; the earlier PASS in PR comment 6966219426 reviewed_code_commit 210c7f1304a920c05947a686ccdccdd2ae44c647 and does not satisfy this new baseline."
+        "Review baseline commit f439cdf01a051130b5f54beca9e032b640f82d72 preserves implementation code commit 210c7f1304a920c05947a686ccdccdd2ae44c647 and additionally contains only the separately approved audit-plan restoration plus removal of its single extra blank line at EOF; no other plan text or implementation code changed.",
+        "Independent Reviewer PASS for the new reviewed_code_commit f439cdf01a051130b5f54beca9e032b640f82d72 is pending; prior review comments cover older baselines and do not satisfy this new baseline."
       ],
       "rejected_evidence": [
         "Changes outside the three approved implementation files or reuse/modification of prior Issue/PR history."
