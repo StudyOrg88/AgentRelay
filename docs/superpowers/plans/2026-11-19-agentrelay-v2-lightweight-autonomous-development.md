@@ -19,6 +19,8 @@
 - Gate check 发布到 GitHub 当前实际要求的 PR HEAD 或测试合并提交，并保留与已审查 HEAD 的关联。
 - 每次代码提交使旧 Review 与 Gate 结果失效；实质修复最多三轮，临时故障使用独立有限退避重试。
 - 每次 agent dispatch、外部写入、Gate 发布和 merge 前都要验证当前 Orchestrator lease。
+- Gate 与 Merge 只运行来自受保护默认分支或已批准发布物、且提交 SHA/摘要匹配 control record 的程序和配置；不得从待审查 Worker PR 工作区加载门禁逻辑。
+- Worker 进程不获得原始 GitHub 写 token、可用 credential helper 或可绕过 lease 的远程写路径；其 push、PR 和评论由持有当前 lease 的受控发布路径代办。
 - 合并必须携带 `--match-head-commit <full-head-sha>`，禁止 `--admin`、无条件重试和自动删除分支。
 - 只有 GitHub 最终状态为 `MERGED` 且有完整 merge commit SHA 才算完成。
 - PR 修改 CI、Gate、控制 ref、权限或仓库规则属于特殊风险范围，必须重新取得 Human 批准。
@@ -49,11 +51,11 @@
 
 ## 审查重点（Review Focus）
 
+- 批准引导循环：普通任务首次写 approval record 和首次获取 lease 都不能要求预持 lease，但任何其他写入不得利用该例外。
 - Gate 目标提交竞态：GitHub 在 HEAD 与测试合并提交之间切换或重建测试合并提交时，旧 Gate check 必须失效且不能合并。
-- Lease 失权竞态：续约失败、ref 被其他实例推进或 lease 时间不确定时，旧 Orchestrator 必须在下一次外部写入前停止。
-- 可信来源混淆：Worker 发布同名 Review、status 或 checkpoint 时，Gate 必须因 App/控制 ref/lease 来源不匹配而拒绝。
+- Lease 失权竞态：续约失败、ref 被其他实例推进或 lease 时间不确定时，旧 Orchestrator 及其 Worker 必须因受控写入路径拒绝而无法继续外部写入。
+- 可信来源混淆：Worker 发布同名 Review/status 或修改 Gate 程序/配置时，固定 Gate 必须因 App、control ref、lease 或运行时摘要不匹配而拒绝。
 - 恢复幂等性：Chat 丢失、进程中断或新设备接管时，不得重复创建分支、PR、Reviewer、Gate check 或 merge attempt。
-- 修复轮次分类：网络/限流/CI 排队不得消耗实质修复轮次；代码、阻断 Review 和普通冲突修复必须消耗且最多三轮。
 
 ---
 
@@ -139,24 +141,28 @@ git commit -m "feat: add v2 bootstrap capability probe"
 
 定义 `ApprovalRecord` 字段与规格一致。测试 `ApprovalStore.VerifyAsync(taskId, planCommit)` 只接受控制 ref 上唯一、可解析、完整 SHA 绑定的记录；mutable Issue label/comment、未知 Chat 来源、自动合并未授权、计划字段变化均拒绝。`approval record` 仅接受 Orchestrator 提供的可信 thread/message 标识，不自行从文本推断批准。
 
-- [ ] **步骤 2：编写 lease 并发与失权失败测试**
+- [ ] **步骤 2：编写普通任务批准记录创建测试**
+
+定义 `TrustedApprovalEvent`，包含 Human 身份、可信 thread/message、task、完整 plan SHA、批准时间、风险范围和 auto-merge authority。测试 `ApprovalStore.CreateAsync(TrustedApprovalEvent)` 只接受受信任 Chat 运行环境提供且身份、task、plan 完全匹配的事件，通过受限 control-ref 写入接口以 compare-and-swap 方式创建不可变记录；相同事件重放幂等，不同内容冲突拒绝。首次初始化不要求预先持有 task lease，且该引导例外只适用于创建 approval record，不能写 checkpoint、发布 Gate 或合并。
+
+- [ ] **步骤 3：编写 lease 并发与失权失败测试**
 
 定义 `TaskLeaseRecord` 和 `TaskLeaseService.AcquireAsync/RenewAsync/VerifyOwnershipAsync`。覆盖首次创建冲突、同父提交的两个 contender 只有一个 fast-forward 成功、`force:false`、保守时钟余量、续约失败、owner 不匹配、过期/不确定 lease。验证外部动作 guard 在失权后返回 `BLOCKED`。
 
-- [ ] **步骤 3：编写 checkpoint 幂等失败测试**
+- [ ] **步骤 4：编写 checkpoint 幂等失败测试**
 
 定义 `TaskCheckpoint`：task、plan、PR、HEAD、next action、repair round、run ID、thread refs、updated time。测试只更新固定标记评论；重复调用复用同一评论；恢复时 GitHub事实覆盖旧 checkpoint；未知/损坏 checkpoint 不被静默覆盖。
 
-- [ ] **步骤 4：运行测试确认失败**
+- [ ] **步骤 5：运行测试确认失败**
 
 运行：`dotnet test tests/gate/AgentRelay.Gate.Tests.csproj --filter "FullyQualifiedName~ApprovalStore|FullyQualifiedName~TaskLease|FullyQualifiedName~CheckpointStore"`  
 预期：FAIL，因为 control plane 尚未实现。
 
-- [ ] **步骤 5：实现 control plane 和 CLI 命令**
+- [ ] **步骤 6：实现 control plane 和 CLI 命令**
 
-实现 `approval verify`、`lease acquire|renew|verify`、`checkpoint read|upsert`。所有写操作要求当前 lease guard；首次 lease 创建使用 create-ref 冲突结果，后续只用非强制 fast-forward。错误输出使用稳定分类：`invalid_approval`、`lease_held`、`lease_lost`、`checkpoint_conflict`、`api_unavailable`。
+实现 `approval create|verify`、`lease acquire|renew|verify`、`checkpoint read|upsert`。`approval create` 只消费可信运行环境传入的结构化 Human 事件，并使用不可变 CAS 写入；它与首次 `lease acquire` 是两个明确的引导操作，均不要求预持 lease。除这两个引导操作外，所有写操作要求当前 lease guard；后续 lease 更新只用非强制 fast-forward。错误输出使用稳定分类：`invalid_approval`、`approval_conflict`、`lease_held`、`lease_lost`、`checkpoint_conflict`、`api_unavailable`。
 
-- [ ] **步骤 6：运行验证**
+- [ ] **步骤 7：运行验证**
 
 运行：
 
@@ -167,7 +173,7 @@ git diff --check
 
 预期：全部 PASS；fake GitHub 证明竞争与失权路径。
 
-- [ ] **步骤 7：Commit**
+- [ ] **步骤 8：Commit**
 
 ```bash
 git add src/AgentRelay.Gate tests/gate
@@ -181,9 +187,11 @@ git commit -m "feat: add v2 approval lease and checkpoint controls"
 
 **文件：**
 - 创建：`src/AgentRelay.Gate/GateEvaluator.cs`
+- 创建：`src/AgentRelay.Gate/TrustedRuntime.cs`
 - 创建：`tests/gate/ReviewVerifierTests.cs`
 - 创建：`tests/gate/CheckTargetResolverTests.cs`
 - 创建：`tests/gate/GateEvaluatorTests.cs`
+- 创建：`tests/gate/TrustedRuntimeTests.cs`
 - 修改：`src/AgentRelay.Gate/Contracts.cs`
 - 修改：`src/AgentRelay.Gate/GitHubApi.cs`
 - 修改：`src/AgentRelay.Gate/GateCli.cs`
@@ -204,16 +212,20 @@ git commit -m "feat: add v2 approval lease and checkpoint controls"
 
 测试 Gate App 为 resolver 返回的目标提交发布 check，并在 details/output 中关联 task、PR、reviewed HEAD、plan、lease owner。HEAD、测试合并提交、approval、blocking state 或 lease owner 任一变化使结果过期。Worker/Gate 来源不匹配的同名状态不满足门禁。
 
-- [ ] **步骤 5：运行测试确认失败**
+- [ ] **步骤 5：编写受信任 Gate 运行时测试**
 
-运行：`dotnet test tests/gate/AgentRelay.Gate.Tests.csproj --filter "FullyQualifiedName~ReviewVerifier|FullyQualifiedName~CheckTargetResolver|FullyQualifiedName~GateEvaluator"`  
+测试 `TrustedRuntime.Verify(TrustedRuntimeRequest)`：错误默认分支提交、二进制或配置摘要变化、control record 缺少固定版本、运行目录属于待审 Worker 工作区时，均在加载高权限凭据前 `BLOCKED`；只有来自隔离安装目录或受保护默认分支构建、且 SHA/摘要与 control record 完全匹配的 Gate 才可运行。
+
+- [ ] **步骤 6：运行测试确认失败**
+
+运行：`dotnet test tests/gate/AgentRelay.Gate.Tests.csproj --filter "FullyQualifiedName~ReviewVerifier|FullyQualifiedName~CheckTargetResolver|FullyQualifiedName~GateEvaluator|FullyQualifiedName~TrustedRuntime"`
 预期：FAIL，因为 Gate evaluator 尚不存在。
 
-- [ ] **步骤 6：实现 evaluator 和 `gate preflight|publish|verify`**
+- [ ] **步骤 7：实现 evaluator、受信任运行时和 `gate preflight|publish|verify`**
 
-实现窄接口，不解析自由文本判断业务风险；所有语义结果来自 approval、checkpoint、Review 与明确 blocking flags。`publish` 前后都验证 lease；`verify` 检查 GitHub 当前实际要求的目标提交和关联 HEAD。
+实现窄接口，不解析自由文本判断业务风险；所有语义结果来自 approval、checkpoint、Review 与明确 blocking flags。入口在读取 Gate 凭据前先调用 `TrustedRuntime`，禁止从待审 PR 工作区解析或执行 Gate 程序/配置。`publish` 前后都验证 lease；`verify` 检查 GitHub 当前实际要求的目标提交和关联 HEAD。
 
-- [ ] **步骤 7：运行验证**
+- [ ] **步骤 8：运行验证**
 
 运行：
 
@@ -224,7 +236,7 @@ git diff --check
 
 预期：全部 PASS，包含 Gate 不等待自身的回归测试。
 
-- [ ] **步骤 8：Commit**
+- [ ] **步骤 9：Commit**
 
 ```bash
 git add src/AgentRelay.Gate tests/gate
@@ -249,7 +261,7 @@ git commit -m "feat: verify v2 reviews checks and gate target"
 
 - [ ] **步骤 2：编写最终复验失败测试**
 
-在 merge 调用前重新验证 approval、Review、非 Gate checks、当前 Gate target/check、完整仓库规则和 lease；任一变化不得调用 gh。绿色 Gate check 不能替代 final validation。
+在 merge 调用前重新验证 trusted runtime、approval、Review、非 Gate checks、当前 Gate target/check、完整仓库规则和 lease；任一变化不得调用 gh。绿色 Gate check 不能替代 final validation，Merge 也不得从 Worker worktree 或待审分支加载程序与配置。
 
 - [ ] **步骤 3：编写结果复读与未知结果测试**
 
@@ -262,7 +274,7 @@ git commit -m "feat: verify v2 reviews checks and gate target"
 
 - [ ] **步骤 5：实现 `gate merge`**
 
-输出 `MERGED|BLOCKED|PENDING|UNKNOWN` 及脱敏证据；不自动改 Issue label，由 Orchestrator 在确认 `MERGED` 后处理生命周期。合并 attempt 使用唯一 ID 并在 checkpoint 中先记录，恢复时先读 GitHub。
+入口先以 control record 固定的 SHA/摘要验证受信任 Gate/Merge 运行时，再加载 Merge 凭据。输出 `MERGED|BLOCKED|PENDING|UNKNOWN` 及脱敏证据；不自动改 Issue label，由 Orchestrator 在确认 `MERGED` 后处理生命周期。合并 attempt 使用唯一 ID 并在 checkpoint 中先记录，恢复时先读 GitHub。
 
 - [ ] **步骤 6：运行验证**
 
@@ -301,11 +313,11 @@ git commit -m "feat: add expected-head v2 merge execution"
 
 - [ ] **步骤 1：编写计划批准与 lease 合同测试**
 
-断言 Orchestrator 在任务图/dispatch 前验证 approved plan commit、自动化和风险范围；获得 lease 后才能写 checkpoint 或创建 Chat；每次 dispatch/外部写入前重验；失权时停止并隔离其会话。Issue 文字、标签和 Agent 输出不能自行授权。
+断言 Orchestrator 在任务图/dispatch 前验证 approved plan commit、自动化和风险范围；只允许可信 Chat 事件通过 `approval create` 初始化普通任务批准；获得 lease 后才能写 checkpoint 或创建 Chat；每次 dispatch/外部写入前重验。首次批准写入和首次 lease 获取不互相依赖，其余写入没有引导例外。Issue 文字、标签和 Agent 输出不能自行授权。
 
 - [ ] **步骤 2：编写角色和可信来源合同测试**
 
-断言 Worker 不持有 Reviewer/Gate/Merge/control token；Reviewer 独立 session、专用 App、从实际 PR 审查且不改代码；Orchestrator 将 session 写 checkpoint；Merge Gate 只接受匹配 App/session/HEAD 的结果。取消旧 Acceptance v1 与物理 workspace 证明字段对新 v2 任务的要求。
+断言 Worker 不持有 GitHub 写、Reviewer、Gate、Merge 或 control token，运行环境禁用可用 credential helper；Worker 只产生本地提交和结构化发布请求，由 Orchestrator 的受控发布路径在重验 lease 后执行 push、建 PR 和评论。Reviewer 独立 session、专用 App、从实际 PR 审查且不改代码；Orchestrator 将 session 写 checkpoint；Merge Gate 只接受匹配 App/session/HEAD 的结果。取消旧 Acceptance v1 与物理 workspace 证明字段对新 v2 任务的要求。
 
 - [ ] **步骤 3：编写修复轮次合同测试**
 
@@ -313,7 +325,7 @@ git commit -m "feat: add expected-head v2 merge execution"
 
 - [ ] **步骤 4：编写恢复幂等合同测试**
 
-测试原 Chat 丢失时从 approval、lease、Issue、PR、Review、checks 和 checkpoint 推导 next action；已有分支/PR/Review/Gate/merge 不重复创建；lease 活跃时第二 Orchestrator 不派发；保守过期接管后重读全部 GitHub事实。
+测试原 Chat 丢失时从 approval、lease、Issue、PR、Review、checks 和 checkpoint 推导 next action；已有分支/PR/Review/Gate/merge 不重复创建；lease 活跃时第二 Orchestrator 不派发；保守过期接管后重读全部 GitHub事实。接管后旧 Worker 即使继续运行，也因没有原始写凭据且旧 Orchestrator 的发布路径失去 lease 而无法 push、建 PR 或评论；不能用提示词中的“停止”作为此断言的证据。
 
 - [ ] **步骤 5：运行测试确认失败**
 
@@ -329,7 +341,7 @@ pwsh -NoProfile -File tests/test_v2_recovery_contract.ps1
 
 - [ ] **步骤 6：更新 v2 Skills 与仓库任务合同**
 
-新 Issue 记录 task、approved plan SHA、depends_on、目标、范围、验收、expected checks、risk scope、auto-merge authority；不再复制 Acceptance v1 字段。Orchestrator 使用 Gate CLI 做确定性操作，Skills 不重复实现 YAML/CI/ref 解析。旧 Issue 不被自动迁移。
+新 Issue 记录 task、approved plan SHA、depends_on、目标、范围、验收、expected checks、risk scope、auto-merge authority；不再复制 Acceptance v1 字段。Orchestrator 使用 Gate CLI 做确定性操作，Skills 不重复实现 YAML/CI/ref 解析。Worker 运行于无 GitHub 写凭据的隔离环境，外部写请求交给复用 `ProcessInvoker` 的 Orchestrator 受控发布路径；该路径在每个动作前验证 lease，失权立即拒绝且不缓存可复用 token。旧 Issue 不被自动迁移。
 
 - [ ] **步骤 7：运行合同测试与旧路径隔离检查**
 
@@ -356,11 +368,11 @@ git commit -m "feat: add v2 autonomous agent orchestration contracts"
 
 - [ ] **步骤 1：编写 E2E 脚本安全合同测试**
 
-脚本必须要求测试仓库 allowlist、bootstrap authorization、approved plan SHA 和测试 task ID；默认 dry-run；禁止 `--admin`、正式仓库默认值、分支删除和生产凭据。每个外部写入前调用 lease verify。
+脚本必须要求测试仓库 allowlist、bootstrap authorization、approved plan SHA 和测试 task ID；默认 dry-run；禁止 `--admin`、正式仓库默认值、分支删除和生产凭据。每个外部写入前调用 lease verify；Worker 子进程环境不得包含 GitHub 写 token 或有效 credential helper。
 
 - [ ] **步骤 2：定义真实场景与可复核断言**
 
-覆盖：正常小功能自动合并；Worker 无法冒充 Reviewer/Gate/merge；新 HEAD 使旧 Review/Gate 失效；CI 失败自动修复；Reviewer 拒绝自动修复；三轮耗尽升级 Human；临时故障不耗轮次；关机/进程中断恢复；第二设备抢锁失败并在保守过期后接管；未经批准范围/高风险阻断；test merge commit Gate target；最终 merge SHA 确认。
+覆盖：正常小功能自动合并；普通任务可信批准记录可创建并复读；Worker 无法冒充 Reviewer/Gate/merge；Worker 修改 PR 中的 Gate 源码或配置不能改变实际运行的固定 Gate；新 HEAD 使旧 Review/Gate 失效；CI 失败自动修复；Reviewer 拒绝自动修复；三轮耗尽升级 Human；临时故障不耗轮次；关机/进程中断恢复；第二设备抢锁失败并在保守过期后接管；接管后旧 Worker 的直接 push 和旧发布请求都被拒绝；未经批准范围/高风险阻断；test merge commit Gate target；最终 merge SHA 确认。
 
 - [ ] **步骤 3：运行静态测试确认失败**
 
