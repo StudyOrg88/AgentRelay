@@ -58,9 +58,11 @@ public static class Program
                 var head = ArgumentValue(args, "--expected-head");
                 var target = ArgumentValue(args, "--active-target");
                 var activePr = int.TryParse(pr, out var parsedPr) ? parsedPr : -1;
-                var expectedTarget = action == ActiveProbeAction.GateCheck ? config.TestMergeSha : config.HeadSha;
+                var validTarget = action == ActiveProbeAction.GateCheck
+                    ? StringComparer.OrdinalIgnoreCase.Equals(target, config.HeadSha) || StringComparer.OrdinalIgnoreCase.Equals(target, config.TestMergeSha)
+                    : StringComparer.OrdinalIgnoreCase.Equals(target, config.HeadSha);
                 if (!StringComparer.Ordinal.Equals(task, authorization.TaskId) || activePr != config.PullRequest || !StringComparer.OrdinalIgnoreCase.Equals(head, config.HeadSha) ||
-                    !StringComparer.OrdinalIgnoreCase.Equals(target, expectedTarget) || !StringComparer.OrdinalIgnoreCase.Equals(authorization.ExpectedTargetCommit, expectedTarget)) return new FailClosedGitHubApi();
+                    !validTarget || !StringComparer.OrdinalIgnoreCase.Equals(authorization.ExpectedTargetCommit, target)) return new FailClosedGitHubApi();
                 var expectedIdentity = action switch
                 {
                     ActiveProbeAction.NativeReview => authorization.ReviewerIdentity,

@@ -40,30 +40,8 @@ public sealed class GitHubRestBootstrapTransport : IGitHubBootstrapTransport
         if (request.Base != "main" || !request.ExpectedChecks.SequenceEqual([_config.RequiredCheck], StringComparer.Ordinal))
             throw Failure(HttpStatusCode.Forbidden);
 
-        var repo = await GetJsonAsync($"repos/{AllowlistedGitHubApi.SandboxRepository}", cancellationToken).ConfigureAwait(false);
-        Require(repo.GetProperty("id").GetInt64() == _config.RepositoryId && repo.GetProperty("full_name").GetString() == AllowlistedGitHubApi.SandboxRepository && repo.GetProperty("default_branch").GetString() == request.Base);
-
-        var pr = await GetJsonAsync($"repos/{AllowlistedGitHubApi.SandboxRepository}/pulls/{_config.PullRequest}", cancellationToken).ConfigureAwait(false);
-        Require(pr.GetProperty("number").GetInt32() == _config.PullRequest && pr.GetProperty("state").GetString() == "open" &&
-            pr.GetProperty("base").GetProperty("ref").GetString() == request.Base &&
-            StringComparer.OrdinalIgnoreCase.Equals(pr.GetProperty("head").GetProperty("sha").GetString(), _config.HeadSha));
-        var mergeSha = pr.GetProperty("merge_commit_sha").GetString();
-        Require(IsSha(mergeSha) && StringComparer.OrdinalIgnoreCase.Equals(mergeSha, _config.TestMergeSha));
-
-        var checks = await GetJsonAsync($"repos/{AllowlistedGitHubApi.SandboxRepository}/commits/{_config.TestMergeSha}/check-runs", cancellationToken).ConfigureAwait(false);
-        var checkRuns = checks.GetProperty("check_runs").EnumerateArray().ToArray();
-        Require(checks.GetProperty("total_count").GetInt32() > 0 && checkRuns.Any(check =>
-            check.GetProperty("name").GetString() == _config.RequiredCheck &&
-            check.GetProperty("conclusion").GetString() == "success" &&
-            check.GetProperty("app").GetProperty("id").GetInt64() == _config.RequiredCheckAppId));
-
-        var protection = await GetJsonAsync($"repos/{AllowlistedGitHubApi.SandboxRepository}/branches/{Uri.EscapeDataString(request.Base)}/protection", cancellationToken).ConfigureAwait(false);
-        var required = protection.GetProperty("required_status_checks").GetProperty("checks").EnumerateArray().ToArray();
-        Require(protection.GetProperty("required_status_checks").GetProperty("strict").GetBoolean() && required.Any(check =>
-            check.GetProperty("context").GetString() == _config.RequiredCheck && check.GetProperty("app_id").GetInt64() == _config.RequiredCheckAppId));
-        Require(protection.GetProperty("enforce_admins").GetProperty("enabled").GetBoolean());
-        Require(!protection.GetProperty("allow_force_pushes").GetProperty("enabled").GetBoolean());
-        Require(!protection.GetProperty("allow_deletions").GetProperty("enabled").GetBoolean());
+        var target = await DiscoverRequiredCheckTargetAsync(request.Base, cancellationToken).ConfigureAwait(false);
+        Require(target.AdminsEnforced && !target.AllowForcePushes && !target.AllowDeletions);
 
         var ruleset = await GetJsonAsync($"repos/{AllowlistedGitHubApi.SandboxRepository}/rulesets/{_config.RulesetId}", cancellationToken).ConfigureAwait(false);
         ValidateRuleset(ruleset);
@@ -87,7 +65,7 @@ public sealed class GitHubRestBootstrapTransport : IGitHubBootstrapTransport
             LeaseCreateUsesNonForceCas: true,
             LeaseCompetitionSingleWinner: true,
             GateTargetKnown: true,
-            GateTargetCommit: mergeSha,
+            GateTargetCommit: target.EffectiveTarget,
             GateTargetsRequiredCommit: true,
             GateTargetAssociatedWithReviewedHead: true);
     }
@@ -126,10 +104,20 @@ public sealed class GitHubRestBootstrapTransport : IGitHubBootstrapTransport
 
     private async Task<ActiveProbeResult> PublishCheckAsync(ActiveProbeRequest request, CancellationToken cancellationToken)
     {
+        var discovered = await DiscoverRequiredCheckTargetAsync("main", cancellationToken).ConfigureAwait(false);
+        Require(StringComparer.OrdinalIgnoreCase.Equals(request.ExpectedHead, discovered.HeadSha) &&
+            StringComparer.OrdinalIgnoreCase.Equals(request.ExpectedTargetCommit, discovered.EffectiveTarget) &&
+            StringComparer.OrdinalIgnoreCase.Equals(_authorization?.ExpectedBaseSha, discovered.BaseSha));
+
+        var current = await DiscoverRequiredCheckTargetAsync("main", cancellationToken).ConfigureAwait(false);
+        Require(discovered == current && StringComparer.OrdinalIgnoreCase.Equals(request.ExpectedHead, current.HeadSha) &&
+            StringComparer.OrdinalIgnoreCase.Equals(request.ExpectedTargetCommit, current.EffectiveTarget) &&
+            StringComparer.OrdinalIgnoreCase.Equals(_authorization?.ExpectedBaseSha, current.BaseSha));
+
         var body = JsonSerializer.Serialize(new
         {
             name = "agentrelay-gate",
-            head_sha = request.ExpectedTargetCommit,
+            head_sha = discovered.EffectiveTarget,
             status = "completed",
             conclusion = "success",
             output = new { title = "Sandbox bootstrap probe", summary = $"Evidence sha256:{ActiveProbeEvidence.Digest(request.Evidence!)}; reviewed_head: {request.ExpectedHead}" }
@@ -137,10 +125,62 @@ public sealed class GitHubRestBootstrapTransport : IGitHubBootstrapTransport
         using var response = await SendAsync(HttpMethod.Post, $"repos/{AllowlistedGitHubApi.SandboxRepository}/check-runs", body, cancellationToken).ConfigureAwait(false);
         using var document = await ReadSuccessfulJsonAsync(response, cancellationToken).ConfigureAwait(false);
         var item = document.RootElement;
-        Require(StringComparer.OrdinalIgnoreCase.Equals(item.GetProperty("head_sha").GetString(), request.ExpectedTargetCommit) &&
+        Require(StringComparer.OrdinalIgnoreCase.Equals(item.GetProperty("head_sha").GetString(), discovered.EffectiveTarget) &&
             item.GetProperty("app").GetProperty("id").GetInt64() == _config.GateAppId);
-        return new ActiveProbeResult(RequireEvidence(item, "html_url", "id"), request.ExpectedTargetCommit, request.ExpectedHead, Evidence: ActiveProbeEvidence.Digest(request.Evidence!));
+        return new ActiveProbeResult(RequireEvidence(item, "html_url", "id"), discovered.EffectiveTarget, request.ExpectedHead, Evidence: ActiveProbeEvidence.Digest(request.Evidence!));
     }
+
+    private async Task<RequiredCheckTarget> DiscoverRequiredCheckTargetAsync(string baseRef, CancellationToken cancellationToken)
+    {
+        var repo = await GetJsonAsync($"repos/{AllowlistedGitHubApi.SandboxRepository}", cancellationToken).ConfigureAwait(false);
+        Require(repo.GetProperty("id").GetInt64() == _config.RepositoryId &&
+            repo.GetProperty("full_name").GetString() == AllowlistedGitHubApi.SandboxRepository &&
+            repo.GetProperty("default_branch").GetString() == baseRef);
+
+        var pr = await GetJsonAsync($"repos/{AllowlistedGitHubApi.SandboxRepository}/pulls/{_config.PullRequest}", cancellationToken).ConfigureAwait(false);
+        var baseInfo = pr.GetProperty("base");
+        var baseSha = baseInfo.GetProperty("sha").GetString();
+        var headSha = pr.GetProperty("head").GetProperty("sha").GetString();
+        var mergeSha = pr.GetProperty("merge_commit_sha").GetString();
+        Require(pr.GetProperty("number").GetInt32() == _config.PullRequest && pr.GetProperty("state").GetString() == "open" &&
+            baseInfo.GetProperty("ref").GetString() == baseRef && IsSha(baseSha) && IsSha(headSha) && IsSha(mergeSha) &&
+            StringComparer.OrdinalIgnoreCase.Equals(headSha, _config.HeadSha) &&
+            StringComparer.OrdinalIgnoreCase.Equals(mergeSha, _config.TestMergeSha));
+
+        var protection = await GetJsonAsync($"repos/{AllowlistedGitHubApi.SandboxRepository}/branches/{Uri.EscapeDataString(baseRef)}/protection", cancellationToken).ConfigureAwait(false);
+        var requiredStatus = protection.GetProperty("required_status_checks");
+        var required = requiredStatus.GetProperty("checks").EnumerateArray().Where(check =>
+            StringComparer.Ordinal.Equals(check.GetProperty("context").GetString(), _config.RequiredCheck)).ToArray();
+        Require(required.Length == 1 && required[0].GetProperty("app_id").GetInt64() == _config.RequiredCheckAppId);
+
+        var strict = requiredStatus.GetProperty("strict").GetBoolean();
+        var headHasRequiredCheck = await HasSuccessfulRequiredCheckAsync(headSha!, cancellationToken).ConfigureAwait(false);
+        var mergeHasRequiredCheck = await HasSuccessfulRequiredCheckAsync(mergeSha!, cancellationToken).ConfigureAwait(false);
+        var target = strict ? (mergeHasRequiredCheck ? mergeSha : null) : (headHasRequiredCheck ? headSha : null);
+        Require(target is not null);
+
+        var adminsEnforced = protection.GetProperty("enforce_admins").GetProperty("enabled").GetBoolean();
+        var allowForcePushes = protection.GetProperty("allow_force_pushes").GetProperty("enabled").GetBoolean();
+        var allowDeletions = protection.GetProperty("allow_deletions").GetProperty("enabled").GetBoolean();
+        return new RequiredCheckTarget(baseRef, baseSha!, headSha!, mergeSha!, strict,
+            _config.RequiredCheck, _config.RequiredCheckAppId, adminsEnforced, allowForcePushes, allowDeletions, target!);
+    }
+
+    private async Task<bool> HasSuccessfulRequiredCheckAsync(string sha, CancellationToken cancellationToken)
+    {
+        var checks = await GetJsonAsync($"repos/{AllowlistedGitHubApi.SandboxRepository}/commits/{sha}/check-runs", cancellationToken).ConfigureAwait(false);
+        var runs = checks.GetProperty("check_runs").EnumerateArray().ToArray();
+        Require(checks.GetProperty("total_count").GetInt32() == runs.Length);
+        return runs.Any(check =>
+            StringComparer.Ordinal.Equals(check.GetProperty("name").GetString(), _config.RequiredCheck) &&
+            StringComparer.OrdinalIgnoreCase.Equals(check.GetProperty("head_sha").GetString(), sha) &&
+            check.GetProperty("status").GetString() == "completed" &&
+            check.GetProperty("conclusion").GetString() == "success" &&
+            check.GetProperty("app").GetProperty("id").GetInt64() == _config.RequiredCheckAppId);
+    }
+
+    private sealed record RequiredCheckTarget(string BaseRef, string BaseSha, string HeadSha, string TestMergeSha,
+        bool Strict, string Context, long AppId, bool AdminsEnforced, bool AllowForcePushes, bool AllowDeletions, string EffectiveTarget);
 
     private async Task<ActiveProbeResult> CompareAndSwapAsync(ActiveProbeRequest request, CancellationToken cancellationToken)
     {
@@ -278,7 +318,7 @@ public sealed class GitHubRestBootstrapTransport : IGitHubBootstrapTransport
     {
         Require(request.PullRequest == _config.PullRequest && StringComparer.OrdinalIgnoreCase.Equals(request.ExpectedHead, _config.HeadSha));
         Require(request.Action == ActiveProbeAction.GateCheck
-            ? StringComparer.OrdinalIgnoreCase.Equals(request.ExpectedTargetCommit, _config.TestMergeSha)
+            ? StringComparer.OrdinalIgnoreCase.Equals(request.ExpectedTargetCommit, _config.TestMergeSha) || StringComparer.OrdinalIgnoreCase.Equals(request.ExpectedTargetCommit, _config.HeadSha)
             : StringComparer.OrdinalIgnoreCase.Equals(request.ExpectedTargetCommit, _config.HeadSha));
         if (request.Action == ActiveProbeAction.NativeReview || request.Action == ActiveProbeAction.GateCheck)
             Require(!string.IsNullOrWhiteSpace(request.Evidence));
@@ -316,7 +356,7 @@ public sealed class GitHubRestBootstrapTransport : IGitHubBootstrapTransport
            authorization.AllowedActions.All(action => action switch
            {
                ActiveProbeAction.NativeReview => authorization.ReviewerIdentity == config.ReviewerAppId.ToString() && authorization.ExpectedReference is null && authorization.ExpectedParent is null && authorization.ExpectedContenders is null && !string.IsNullOrWhiteSpace(authorization.Evidence),
-               ActiveProbeAction.GateCheck => authorization.GateIdentity == config.GateAppId.ToString() && authorization.ExpectedReference is null && authorization.ExpectedParent is null && authorization.ExpectedContenders is null && !string.IsNullOrWhiteSpace(authorization.Evidence),
+               ActiveProbeAction.GateCheck => authorization.GateIdentity == config.GateAppId.ToString() && IsSha(authorization.ExpectedBaseSha) && authorization.ExpectedReference is null && authorization.ExpectedParent is null && authorization.ExpectedContenders is null && !string.IsNullOrWhiteSpace(authorization.Evidence),
                ActiveProbeAction.LeaseCompareAndSwap => authorization.OrchestratorIdentity == config.OrchestratorAppId.ToString() && authorization.ExpectedReference == config.LeaseReference && IsSha(authorization.ExpectedParent) && authorization.ExpectedContenders is { Count: 2 } && authorization.ExpectedContenders.All(IsSha) && authorization.ExpectedContenders[0] != authorization.ExpectedContenders[1] && !string.IsNullOrWhiteSpace(authorization.Evidence),
                ActiveProbeAction.WorkerNegativePermission => authorization.WorkerIdentity == config.WorkerAppId.ToString() && authorization.ExpectedReference == config.ControlReference && authorization.ExpectedParent is null && authorization.ExpectedContenders is null && !string.IsNullOrWhiteSpace(authorization.Evidence),
                _ => false

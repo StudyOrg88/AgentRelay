@@ -48,7 +48,8 @@ public sealed record ActiveProbeAuthorization(
     string? ExpectedReference = null,
     string? ExpectedParent = null,
     IReadOnlyList<string>? ExpectedContenders = null,
-    string? Evidence = null);
+    string? Evidence = null,
+    string? ExpectedBaseSha = null);
 
 public enum ActiveProbeAction
 {
