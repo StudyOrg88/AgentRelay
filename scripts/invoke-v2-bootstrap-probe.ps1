@@ -12,6 +12,9 @@ param(
     [int] $TestPr,
     [string] $ExpectedHead,
     [string] $AuthorizationFile,
+    [ValidateSet('native-review', 'gate-check', 'lease-compare-and-swap', 'worker-negative-permission')]
+    [string] $ActiveAction,
+    [string] $ActiveIdentity,
     [switch] $Execute
 )
 
@@ -26,11 +29,11 @@ foreach ($check in $ExpectedChecks) { $arguments.Add('--expected-check'); $argum
 $arguments.AddRange([string[]]@('--reviewer-app', $ReviewerApp, '--gate-app', $GateApp, '--merge-app', $MergeApp))
 
 if ($Active) {
-    if (-not $TestTask -or $TestPr -le 0 -or $ExpectedHead -notmatch '^[0-9a-fA-F]{40}$' -or -not $AuthorizationFile) {
-        throw 'Active probe requires test task, test PR, full expected HEAD, and authorization file.'
+    if (-not $TestTask -or $TestPr -le 0 -or $ExpectedHead -notmatch '^[0-9a-fA-F]{40}$' -or -not $AuthorizationFile -or -not $ActiveAction -or -not $ActiveIdentity) {
+        throw 'Active probe requires test task, test PR, full expected HEAD, authorization file, exact action, and identity.'
     }
     if (-not (Test-Path -LiteralPath $AuthorizationFile -PathType Leaf)) { throw 'Authorization file does not exist.' }
-    $arguments.AddRange([string[]]@('--active', '--test-task', $TestTask, '--test-pr', [string]$TestPr, '--expected-head', $ExpectedHead, '--authorization-file', (Resolve-Path -LiteralPath $AuthorizationFile).Path))
+    $arguments.AddRange([string[]]@('--active', '--test-task', $TestTask, '--test-pr', [string]$TestPr, '--expected-head', $ExpectedHead, '--authorization-file', (Resolve-Path -LiteralPath $AuthorizationFile).Path, '--active-action', $ActiveAction, '--active-identity', $ActiveIdentity))
 }
 
 if (-not $Execute) {

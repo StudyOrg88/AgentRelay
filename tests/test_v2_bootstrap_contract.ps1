@@ -4,7 +4,7 @@ $scriptPath = Join-Path $root 'scripts/invoke-v2-bootstrap-probe.ps1'
 $scriptText = Get-Content -Raw -LiteralPath $scriptPath
 
 if ($scriptText -match '(?i)--admin|--delete-branch|gh\s+pr\s+merge|ruleset|/rules') { throw 'Bootstrap script contains a forbidden merge or repository-rules operation.' }
-foreach ($required in @('AllowedTestRepositories', 'DRY_RUN', 'AuthorizationFile', 'ExpectedHead', 'TestPr', 'TestTask', 'GH_TOKEN', "StartsWith('AGENTRELAY_TOKEN_'", 'Environment.Remove', '$process.Environment[$tokenName] = $token')) {
+foreach ($required in @('AllowedTestRepositories', 'DRY_RUN', 'AuthorizationFile', 'ExpectedHead', 'TestPr', 'TestTask', 'ActiveAction', 'ActiveIdentity', '--active-action', '--active-identity', 'GH_TOKEN', "StartsWith('AGENTRELAY_TOKEN_'", 'Environment.Remove', '$process.Environment[$tokenName] = $token')) {
     if ($scriptText -notmatch [regex]::Escape($required)) { throw "Bootstrap script is missing required boundary: $required" }
 }
 if ($scriptText -notmatch "Environment\['GH_TOKEN'\] = \`$token") { throw 'Selected role token must be the only token copied to GH_TOKEN.' }

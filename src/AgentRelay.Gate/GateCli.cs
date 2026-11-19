@@ -1,16 +1,17 @@
 using System.Text.Json;
+using System.Text.Json.Serialization;
 
 namespace AgentRelay.Gate;
 
 public static class GateCli
 {
-    private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web) { WriteIndented = false };
+    private static readonly JsonSerializerOptions JsonOptions = CreateJsonOptions();
 
     public static async Task<int> RunAsync(string[] args, GateDependencies dependencies, TextWriter output, TextWriter error, CancellationToken cancellationToken)
     {
         if (args.Length == 0 || args[0] is "--help" or "-h")
         {
-            await output.WriteLineAsync("Usage: agentrelay-gate probe --repo owner/repo --base ref --expected-check name --reviewer-app app --gate-app app --merge-app app [--active --test-task id --test-pr n --expected-head sha --authorization-file path]");
+            await output.WriteLineAsync("Usage: agentrelay-gate probe --repo owner/repo --base ref --expected-check name --reviewer-app app --gate-app app --merge-app app [--active --test-task id --test-pr n --expected-head sha --authorization-file path --active-action action --active-identity identity]");
             return 0;
         }
 
@@ -25,16 +26,35 @@ public static class GateCli
         var request = new BootstrapProbeRequest(parsed.Single("repo")!, parsed.Single("base")!, expectedChecks!, parsed.Single("reviewer-app")!, parsed.Single("gate-app")!, parsed.Single("merge-app")!);
         if (parsed.Flags.Contains("active"))
         {
-            var activeKeys = new[] { "test-task", "test-pr", "expected-head", "authorization-file" };
+            var activeKeys = new[] { "test-task", "test-pr", "expected-head", "authorization-file", "active-action", "active-identity" };
             if (activeKeys.Any(key => string.IsNullOrWhiteSpace(parsed.Single(key)))) return await WriteAsync(output, 2, "BLOCKED", ["active_probe_requires_binding"]);
             if (!int.TryParse(parsed.Single("test-pr"), out var pullRequest) || !IsFullSha(parsed.Single("expected-head")!)) return await WriteAsync(output, 2, "BLOCKED", ["active_probe_requires_binding"]);
+            if (!TryParseAction(parsed.Single("active-action")!, out var action)) return await WriteAsync(output, 2, "BLOCKED", ["active_probe_requires_binding"]);
             var authorization = await ReadAuthorizationAsync(parsed.Single("authorization-file")!, cancellationToken).ConfigureAwait(false);
             if (authorization is null || !authorization.AllowActiveProbe || authorization.ExpiresAt <= DateTimeOffset.UtcNow ||
                 !StringComparer.Ordinal.Equals(authorization.Repository, request.Repository) || authorization.PullRequest != pullRequest ||
                 !StringComparer.OrdinalIgnoreCase.Equals(authorization.ExpectedHead, parsed.Single("expected-head")) ||
                 !StringComparer.Ordinal.Equals(authorization.TaskId, parsed.Single("test-task")))
                 return await WriteAsync(output, 3, "BLOCKED", ["authorization_mismatch"]);
-            return await WriteAsync(output, 3, "BLOCKED", ["active_probe_not_configured"]);
+            if (dependencies.GitHub is not IActiveGitHubApi activeApi)
+                return await WriteAsync(output, 3, "BLOCKED", ["active_probe_not_configured"]);
+
+            var activeRequest = new ActiveProbeRequest(
+                request.Repository,
+                parsed.Single("test-task")!,
+                pullRequest,
+                parsed.Single("expected-head")!,
+                action,
+                parsed.Single("active-identity")!);
+            try
+            {
+                await activeApi.ExecuteActiveAsync(activeRequest, authorization, cancellationToken).ConfigureAwait(false);
+                return await WriteAsync(output, 0, "ACTIVE_COMPLETED", []);
+            }
+            catch (GitHubApiException exception)
+            {
+                return await WriteAsync(output, 3, "BLOCKED", [exception.SafeReason]);
+            }
         }
 
         var result = await new BootstrapProbe().EvaluateAsync(request, dependencies.GitHub, cancellationToken).ConfigureAwait(false);
@@ -52,6 +72,26 @@ public static class GateCli
     }
 
     private static bool IsFullSha(string value) => value.Length == 40 && value.All(Uri.IsHexDigit);
+
+    private static bool TryParseAction(string value, out ActiveProbeAction action)
+    {
+        action = value switch
+        {
+            "native-review" => ActiveProbeAction.NativeReview,
+            "gate-check" => ActiveProbeAction.GateCheck,
+            "lease-compare-and-swap" => ActiveProbeAction.LeaseCompareAndSwap,
+            "worker-negative-permission" => ActiveProbeAction.WorkerNegativePermission,
+            _ => default
+        };
+        return value is "native-review" or "gate-check" or "lease-compare-and-swap" or "worker-negative-permission";
+    }
+
+    private static JsonSerializerOptions CreateJsonOptions()
+    {
+        var options = new JsonSerializerOptions(JsonSerializerDefaults.Web) { WriteIndented = false };
+        options.Converters.Add(new JsonStringEnumConverter(JsonNamingPolicy.CamelCase));
+        return options;
+    }
 
     private static async Task<int> WriteAsync(TextWriter output, int exitCode, string status, IReadOnlyList<string> blockers)
     {

@@ -37,7 +37,31 @@ public sealed record ActiveProbeAuthorization(
     string ExpectedHead,
     DateTimeOffset ExpiresAt,
     bool AllowActiveProbe,
-    string? TaskId = null);
+    string? TaskId = null,
+    IReadOnlyList<ActiveProbeAction>? AllowedActions = null,
+    string? ReviewerIdentity = null,
+    string? GateIdentity = null,
+    string? MergeIdentity = null,
+    string? WorkerIdentity = null,
+    string? OrchestratorIdentity = null);
+
+public enum ActiveProbeAction
+{
+    NativeReview,
+    GateCheck,
+    LeaseCompareAndSwap,
+    WorkerNegativePermission
+}
+
+public sealed record ActiveProbeRequest(
+    string Repository,
+    string TaskId,
+    int PullRequest,
+    string ExpectedHead,
+    ActiveProbeAction Action,
+    string Identity);
+
+public sealed record ActiveProbeResult(string EvidenceId, string TargetCommit);
 
 public sealed record ProcessResult(int ExitCode, string StandardOutput, string StandardError);
 
