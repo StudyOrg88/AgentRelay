@@ -50,7 +50,7 @@ public static class Program
                     "worker-negative-permission" => ActiveProbeAction.WorkerNegativePermission,
                     _ => (ActiveProbeAction?)null
                 };
-                if (action is null || !authorization.AllowedActions.Contains(action.Value) || !HasValidActionBinding(args, action.Value, config)) return new FailClosedGitHubApi();
+                if (action is null || authorization.AllowedActions.Count != 1 || !authorization.AllowedActions.Contains(action.Value) || !HasValidActionBinding(args, action.Value, config, authorization)) return new FailClosedGitHubApi();
                 var identityIndex = Array.IndexOf(args, "--active-identity");
                 var identity = identityIndex >= 0 && identityIndex + 1 < args.Length ? args[identityIndex + 1] : null;
                 var task = ArgumentValue(args, "--test-task");
@@ -92,19 +92,25 @@ public static class Program
         return index >= 0 && index + 1 < args.Length ? args[index + 1] : null;
     }
 
-    private static bool HasValidActionBinding(string[] args, ActiveProbeAction action, StageOneGitHubConfig config)
+    private static bool HasValidActionBinding(string[] args, ActiveProbeAction action, StageOneGitHubConfig config, ActiveProbeAuthorization authorization)
     {
         static bool FullSha(string? value) => value is { Length: 40 } && value.All(Uri.IsHexDigit);
         var evidence = ArgumentValue(args, "--evidence");
+        var reference = ArgumentValue(args, "--active-ref");
+        var parent = ArgumentValue(args, "--expected-parent");
+        var contendersValue = ArgumentValue(args, "--contenders");
+        var contenders = contendersValue?.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        if (authorization.ExpectedReference != reference || authorization.ExpectedParent != parent ||
+            !(authorization.ExpectedContenders ?? []).SequenceEqual(contenders ?? [], StringComparer.OrdinalIgnoreCase) || authorization.Evidence != evidence)
+            return false;
         return action switch
         {
-            ActiveProbeAction.NativeReview or ActiveProbeAction.GateCheck => !string.IsNullOrWhiteSpace(evidence),
-            ActiveProbeAction.LeaseCompareAndSwap => ArgumentValue(args, "--active-ref") == config.LeaseReference &&
-                FullSha(ArgumentValue(args, "--expected-parent")) &&
+            ActiveProbeAction.NativeReview or ActiveProbeAction.GateCheck => !string.IsNullOrWhiteSpace(evidence) && reference is null && parent is null && contenders is null,
+            ActiveProbeAction.LeaseCompareAndSwap => reference == config.LeaseReference &&
+                FullSha(parent) &&
                 !string.IsNullOrWhiteSpace(evidence) &&
-                ArgumentValue(args, "--contenders") is { } contenders &&
-                contenders.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries) is { Length: 2 } shas && shas.All(FullSha) && shas[0] != shas[1],
-            ActiveProbeAction.WorkerNegativePermission => ArgumentValue(args, "--active-ref") == config.ControlReference && !string.IsNullOrWhiteSpace(evidence),
+                contenders is { Length: 2 } shas && shas.All(FullSha) && shas[0] != shas[1],
+            ActiveProbeAction.WorkerNegativePermission => reference == config.ControlReference && parent is null && contenders is null && !string.IsNullOrWhiteSpace(evidence),
             _ => false
         };
     }

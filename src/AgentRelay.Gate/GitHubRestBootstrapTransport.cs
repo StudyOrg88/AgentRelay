@@ -114,13 +114,14 @@ public sealed class GitHubRestBootstrapTransport : IGitHubBootstrapTransport
 
     private async Task<ActiveProbeResult> PublishReviewAsync(ActiveProbeRequest request, CancellationToken cancellationToken)
     {
-        var body = JsonSerializer.Serialize(new { commit_id = request.ExpectedHead, body = request.Evidence, @event = "COMMENT" });
+        var evidenceDigest = ActiveProbeEvidence.Digest(request.Evidence!);
+        var body = JsonSerializer.Serialize(new { commit_id = request.ExpectedHead, body = $"AgentRelay bootstrap probe evidence sha256:{evidenceDigest}", @event = "COMMENT" });
         using var response = await SendAsync(HttpMethod.Post, $"repos/{AllowlistedGitHubApi.SandboxRepository}/pulls/{_config.PullRequest}/reviews", body, cancellationToken).ConfigureAwait(false);
         using var document = await ReadSuccessfulJsonAsync(response, cancellationToken).ConfigureAwait(false);
         var item = document.RootElement;
         Require(StringComparer.OrdinalIgnoreCase.Equals(item.GetProperty("commit_id").GetString(), request.ExpectedHead));
         Require(item.GetProperty("performed_via_github_app").GetProperty("id").GetInt64() == _config.ReviewerAppId);
-        return new ActiveProbeResult(RequireEvidence(item, "html_url", "id"), request.ExpectedHead, request.ExpectedHead, Evidence: request.Evidence);
+        return new ActiveProbeResult(RequireEvidence(item, "html_url", "id"), request.ExpectedHead, request.ExpectedHead, Evidence: evidenceDigest);
     }
 
     private async Task<ActiveProbeResult> PublishCheckAsync(ActiveProbeRequest request, CancellationToken cancellationToken)
@@ -131,14 +132,14 @@ public sealed class GitHubRestBootstrapTransport : IGitHubBootstrapTransport
             head_sha = request.ExpectedTargetCommit,
             status = "completed",
             conclusion = "success",
-            output = new { title = "Sandbox bootstrap probe", summary = $"Evidence: {request.Evidence}; reviewed_head: {request.ExpectedHead}" }
+            output = new { title = "Sandbox bootstrap probe", summary = $"Evidence sha256:{ActiveProbeEvidence.Digest(request.Evidence!)}; reviewed_head: {request.ExpectedHead}" }
         });
         using var response = await SendAsync(HttpMethod.Post, $"repos/{AllowlistedGitHubApi.SandboxRepository}/check-runs", body, cancellationToken).ConfigureAwait(false);
         using var document = await ReadSuccessfulJsonAsync(response, cancellationToken).ConfigureAwait(false);
         var item = document.RootElement;
         Require(StringComparer.OrdinalIgnoreCase.Equals(item.GetProperty("head_sha").GetString(), request.ExpectedTargetCommit) &&
             item.GetProperty("app").GetProperty("id").GetInt64() == _config.GateAppId);
-        return new ActiveProbeResult(RequireEvidence(item, "html_url", "id"), request.ExpectedTargetCommit, request.ExpectedHead, Evidence: request.Evidence);
+        return new ActiveProbeResult(RequireEvidence(item, "html_url", "id"), request.ExpectedTargetCommit, request.ExpectedHead, Evidence: ActiveProbeEvidence.Digest(request.Evidence!));
     }
 
     private async Task<ActiveProbeResult> CompareAndSwapAsync(ActiveProbeRequest request, CancellationToken cancellationToken)
@@ -171,7 +172,7 @@ public sealed class GitHubRestBootstrapTransport : IGitHubBootstrapTransport
         }
         Require(outcomes.Count(item => item.Won) == 1);
         return new ActiveProbeResult($"lease-cas:{string.Join(',', outcomes.Select(item => $"{item.Commit[..12]}={(item.Won ? "won" : "lost")}"))}", request.ExpectedTargetCommit, request.ExpectedHead,
-            request.Reference, request.ExpectedParent, contenders, request.Evidence);
+            request.Reference, request.ExpectedParent, contenders, ActiveProbeEvidence.Digest(request.Evidence!));
     }
 
     private async Task<ActiveProbeResult> ReadWorkerPermissionsAsync(ActiveProbeRequest request, CancellationToken cancellationToken)
@@ -188,7 +189,7 @@ public sealed class GitHubRestBootstrapTransport : IGitHubBootstrapTransport
         var control = await GetOptionalJsonAsync($"repos/{AllowlistedGitHubApi.SandboxRepository}/git/ref/{ToApiRef(_config.ControlReference)}", cancellationToken).ConfigureAwait(false);
         var lease = await GetOptionalJsonAsync($"repos/{AllowlistedGitHubApi.SandboxRepository}/git/ref/{ToApiRef(_config.LeaseReference)}", cancellationToken).ConfigureAwait(false);
         Require(control is null && lease is null);
-        var reviewBody = JsonSerializer.Serialize(new { commit_id = request.ExpectedHead, body = request.Evidence ?? "AgentRelay worker permission probe" });
+        var reviewBody = JsonSerializer.Serialize(new { commit_id = request.ExpectedHead, body = $"AgentRelay worker permission probe sha256:{ActiveProbeEvidence.Digest(request.Evidence!)}" });
         using var createAttempt = await SendAsync(HttpMethod.Post, $"repos/{AllowlistedGitHubApi.SandboxRepository}/pulls/{_config.PullRequest}/reviews", reviewBody, cancellationToken).ConfigureAwait(false);
         var reviewWriteDenied = createAttempt.StatusCode == HttpStatusCode.Forbidden;
         if (createAttempt.IsSuccessStatusCode)
@@ -203,7 +204,7 @@ public sealed class GitHubRestBootstrapTransport : IGitHubBootstrapTransport
             throw Failure(createAttempt.StatusCode);
         Require(!permissions.TryGetProperty("checks", out _) && !permissions.TryGetProperty("administration", out _));
         return new ActiveProbeResult($"worker-permissions:{_config.WorkerAppId}:contents=read,pulls=read,checks=absent,administration=absent,merge=absent,bypass=absent,control-write=absent,lease-write=absent,review-write=403,pending-review=not-created", request.ExpectedTargetCommit, request.ExpectedHead,
-            request.Reference, Evidence: request.Evidence);
+            request.Reference, Evidence: ActiveProbeEvidence.Digest(request.Evidence!));
     }
 
     private async Task<JsonElement> GetJsonAsync(string path, CancellationToken cancellationToken)
@@ -297,23 +298,27 @@ public sealed class GitHubRestBootstrapTransport : IGitHubBootstrapTransport
         };
         Require(authorization is { AllowActiveProbe: true } && authorization.ExpiresAt > DateTimeOffset.UtcNow &&
             authorization.Repository == AllowlistedGitHubApi.SandboxRepository && authorization.PullRequest == request.PullRequest &&
-            authorization.TaskId == request.TaskId && authorization.AllowedActions?.Contains(request.Action) == true &&
+            authorization.TaskId == request.TaskId && authorization.AllowedActions is { Count: 1 } && authorization.AllowedActions.Contains(request.Action) &&
             StringComparer.OrdinalIgnoreCase.Equals(authorization.ExpectedHead, request.ExpectedHead) &&
             StringComparer.OrdinalIgnoreCase.Equals(authorization.ExpectedTargetCommit, request.ExpectedTargetCommit) &&
+            StringComparer.Ordinal.Equals(authorization.ExpectedReference, request.Reference) &&
+            StringComparer.OrdinalIgnoreCase.Equals(authorization.ExpectedParent, request.ExpectedParent) &&
+            (authorization.ExpectedContenders ?? []).SequenceEqual(request.Contenders ?? [], StringComparer.OrdinalIgnoreCase) &&
+            StringComparer.Ordinal.Equals(authorization.Evidence, request.Evidence) &&
             StringComparer.Ordinal.Equals(expectedIdentity, request.Identity));
     }
 
     private static bool IsValidAuthorization(ActiveProbeAuthorization? authorization, StageOneGitHubConfig config)
-        => authorization is { AllowActiveProbe: true, AllowedActions.Count: > 0 } && authorization.ExpiresAt > DateTimeOffset.UtcNow &&
+        => authorization is { AllowActiveProbe: true, AllowedActions.Count: 1 } && authorization.ExpiresAt > DateTimeOffset.UtcNow &&
            authorization.Repository == AllowlistedGitHubApi.SandboxRepository && authorization.TaskId == "v2_bootstrap_probe" &&
            authorization.PullRequest == config.PullRequest && StringComparer.OrdinalIgnoreCase.Equals(authorization.ExpectedHead, config.HeadSha) &&
            (StringComparer.OrdinalIgnoreCase.Equals(authorization.ExpectedTargetCommit, config.HeadSha) || StringComparer.OrdinalIgnoreCase.Equals(authorization.ExpectedTargetCommit, config.TestMergeSha)) &&
            authorization.AllowedActions.All(action => action switch
            {
-               ActiveProbeAction.NativeReview => authorization.ReviewerIdentity == config.ReviewerAppId.ToString(),
-               ActiveProbeAction.GateCheck => authorization.GateIdentity == config.GateAppId.ToString(),
-               ActiveProbeAction.LeaseCompareAndSwap => authorization.OrchestratorIdentity == config.OrchestratorAppId.ToString(),
-               ActiveProbeAction.WorkerNegativePermission => authorization.WorkerIdentity == config.WorkerAppId.ToString(),
+               ActiveProbeAction.NativeReview => authorization.ReviewerIdentity == config.ReviewerAppId.ToString() && authorization.ExpectedReference is null && authorization.ExpectedParent is null && authorization.ExpectedContenders is null && !string.IsNullOrWhiteSpace(authorization.Evidence),
+               ActiveProbeAction.GateCheck => authorization.GateIdentity == config.GateAppId.ToString() && authorization.ExpectedReference is null && authorization.ExpectedParent is null && authorization.ExpectedContenders is null && !string.IsNullOrWhiteSpace(authorization.Evidence),
+               ActiveProbeAction.LeaseCompareAndSwap => authorization.OrchestratorIdentity == config.OrchestratorAppId.ToString() && authorization.ExpectedReference == config.LeaseReference && IsSha(authorization.ExpectedParent) && authorization.ExpectedContenders is { Count: 2 } && authorization.ExpectedContenders.All(IsSha) && authorization.ExpectedContenders[0] != authorization.ExpectedContenders[1] && !string.IsNullOrWhiteSpace(authorization.Evidence),
+               ActiveProbeAction.WorkerNegativePermission => authorization.WorkerIdentity == config.WorkerAppId.ToString() && authorization.ExpectedReference == config.ControlReference && authorization.ExpectedParent is null && authorization.ExpectedContenders is null && !string.IsNullOrWhiteSpace(authorization.Evidence),
                _ => false
            });
 

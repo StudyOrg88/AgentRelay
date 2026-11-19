@@ -68,7 +68,7 @@ public sealed class GitHubRestTransportTests
         try
         {
             File.WriteAllText(configPath, JsonSerializer.Serialize(StageOneConfig()));
-            File.WriteAllText(authPath, JsonSerializer.Serialize(Authorization(ActiveProbeAction.NativeReview)));
+            File.WriteAllText(authPath, JsonSerializer.Serialize(Authorization(ActiveProbeAction.NativeReview) with { Evidence = "review probe" }));
             var reads = new List<string>();
             var args = new[] { "--live-sandbox", "--stage-one-config", configPath, "--active", "--authorization-file", authPath,
                 "--active-action", "native-review", "--active-identity", "5826689", "--test-task", "v2_bootstrap_probe", "--test-pr", "1",
@@ -93,6 +93,19 @@ public sealed class GitHubRestTransportTests
         var transport = new GitHubRestBootstrapTransport(new HttpClient(handler), "active-token", StageOneConfig());
 
         await Assert.ThrowsAsync<GitHubTransportException>(() => transport.ExecuteActiveAsync(ActiveRequest(ActiveProbeAction.NativeReview) with { Evidence = "probe" }, CancellationToken.None));
+
+        Assert.Empty(handler.Requests);
+    }
+
+    [Fact]
+    public async Task ActiveOperationCannotChangeEvidenceFromStageTwoAuthorization()
+    {
+        var handler = new ScriptedHandler(new Dictionary<string, HttpResponseMessage>());
+        var authorization = Authorization(ActiveProbeAction.NativeReview) with { Evidence = "authorized evidence" };
+        var transport = new GitHubRestBootstrapTransport(new HttpClient(handler), "active-token", StageOneConfig(), true, authorization);
+
+        await Assert.ThrowsAsync<GitHubTransportException>(() => transport.ExecuteActiveAsync(
+            ActiveRequest(ActiveProbeAction.NativeReview) with { Evidence = "different evidence" }, CancellationToken.None));
 
         Assert.Empty(handler.Requests);
     }
@@ -145,6 +158,8 @@ public sealed class GitHubRestTransportTests
         Assert.NotNull(result);
         Assert.Single(handler.Requests);
         Assert.Equal(path, handler.Requests[0].Path);
+        Assert.DoesNotContain("probe-evidence", handler.Bodies[0]);
+        Assert.Contains(ActiveProbeEvidence.Digest("probe-evidence"), handler.Bodies[0]);
         Assert.DoesNotContain("merge", handler.Requests[0].Path, StringComparison.OrdinalIgnoreCase);
     }
 
@@ -200,6 +215,8 @@ public sealed class GitHubRestTransportTests
         Assert.NotNull(result);
         Assert.All(handler.Requests.Where(request => request.Method != HttpMethod.Post), request => Assert.Equal(HttpMethod.Get, request.Method));
         Assert.Equal("/repos/StudyOrg88/AgentRelay-v2-sandbox/pulls/1/reviews", Assert.Single(handler.Requests, request => request.Method == HttpMethod.Post).Path);
+        Assert.DoesNotContain("worker-permission-snapshot", handler.Bodies[^1]);
+        Assert.Contains(ActiveProbeEvidence.Digest("worker-permission-snapshot"), handler.Bodies[^1]);
         Assert.DoesNotContain(handler.Requests, request => request.Path.Contains("merge", StringComparison.OrdinalIgnoreCase));
     }
 
@@ -210,7 +227,16 @@ public sealed class GitHubRestTransportTests
 
     private static ActiveProbeAuthorization Authorization(ActiveProbeAction action) => new(
         Repository, 1, Head, DateTimeOffset.UtcNow.AddMinutes(10), true, "v2_bootstrap_probe", [action],
-        "5826689", "5826708", "5826720", "5826750", "5827575", action == ActiveProbeAction.GateCheck ? TestMerge : Head);
+        "5826689", "5826708", "5826720", "5826750", "5827575", action == ActiveProbeAction.GateCheck ? TestMerge : Head,
+        action == ActiveProbeAction.LeaseCompareAndSwap ? "refs/heads/agentrelay-locks/v2_bootstrap_probe" : action == ActiveProbeAction.WorkerNegativePermission ? "refs/heads/agentrelay-control" : null,
+        action == ActiveProbeAction.LeaseCompareAndSwap ? Head : null,
+        action == ActiveProbeAction.LeaseCompareAndSwap ? [new string('a', 40), new string('b', 40)] : null,
+        action switch
+        {
+            ActiveProbeAction.LeaseCompareAndSwap => "lease-race",
+            ActiveProbeAction.WorkerNegativePermission => "worker-permission-snapshot",
+            _ => "probe-evidence"
+        });
 
     private static string Identity(ActiveProbeAction action) => action switch
     {

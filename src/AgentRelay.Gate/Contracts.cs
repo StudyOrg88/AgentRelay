@@ -44,7 +44,11 @@ public sealed record ActiveProbeAuthorization(
     string? MergeIdentity = null,
     string? WorkerIdentity = null,
     string? OrchestratorIdentity = null,
-    string? ExpectedTargetCommit = null);
+    string? ExpectedTargetCommit = null,
+    string? ExpectedReference = null,
+    string? ExpectedParent = null,
+    IReadOnlyList<string>? ExpectedContenders = null,
+    string? Evidence = null);
 
 public enum ActiveProbeAction
 {
@@ -75,6 +79,12 @@ public sealed record ActiveProbeResult(
     string? ExpectedParent = null,
     IReadOnlyList<string>? Contenders = null,
     string? Evidence = null);
+
+public static class ActiveProbeEvidence
+{
+    public static string Digest(string value)
+        => Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(value))).ToLowerInvariant();
+}
 
 public sealed record StageOneGitHubConfig(
     long RepositoryId,

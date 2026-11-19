@@ -61,7 +61,7 @@ public sealed class GitHubAdapterTests
     [Fact]
     public async Task AuthorizedNativeReviewUsesOnlyBoundOperation()
     {
-        var transport = new RecordingBootstrapTransport { ActiveResult = new ActiveProbeResult("review-id", Head, Head, Evidence: "probe evidence") };
+        var transport = new RecordingBootstrapTransport { ActiveResult = new ActiveProbeResult("review-id", Head, Head, Evidence: ActiveProbeEvidence.Digest("probe evidence")) };
         var api = new AllowlistedGitHubApi(transport, new FixedClock(Now));
 
         var result = await api.ExecuteActiveAsync(ActiveRequest() with { Evidence = "probe evidence" }, ValidAuthorization(), CancellationToken.None);
@@ -114,7 +114,7 @@ public sealed class GitHubAdapterTests
             Contenders = action == ActiveProbeAction.LeaseCompareAndSwap ? [new string('b', 40), new string('c', 40)] : null
         };
 
-        await api.ExecuteActiveAsync(request, ValidAuthorization(), CancellationToken.None);
+            await api.ExecuteActiveAsync(request, ValidAuthorization(action), CancellationToken.None);
 
         Assert.Equal(action, Assert.Single(transport.Requests).Action);
     }
@@ -138,10 +138,13 @@ public sealed class GitHubAdapterTests
     private static ActiveProbeRequest ActiveRequest()
         => new(Sandbox, "v2_bootstrap_probe", 1, Head, Head, ActiveProbeAction.NativeReview, "reviewer-app", Evidence: "probe evidence");
 
-    private static ActiveProbeAuthorization ValidAuthorization()
-        => new(Sandbox, 1, Head, Now.AddMinutes(30), true, "v2_bootstrap_probe",
-            [ActiveProbeAction.NativeReview, ActiveProbeAction.GateCheck, ActiveProbeAction.LeaseCompareAndSwap, ActiveProbeAction.WorkerNegativePermission],
-            "reviewer-app", "gate-app", "merge-app", "worker-app", "orchestrator-app", Head);
+    private static ActiveProbeAuthorization ValidAuthorization(ActiveProbeAction action = ActiveProbeAction.NativeReview)
+        => new(Sandbox, 1, Head, Now.AddMinutes(30), true, "v2_bootstrap_probe", [action],
+            "reviewer-app", "gate-app", "merge-app", "worker-app", "orchestrator-app", Head,
+            action == ActiveProbeAction.LeaseCompareAndSwap ? "refs/heads/agentrelay-locks/v2_bootstrap_probe" : action == ActiveProbeAction.WorkerNegativePermission ? "refs/heads/agentrelay-control" : null,
+            action == ActiveProbeAction.LeaseCompareAndSwap ? Head : null,
+            action == ActiveProbeAction.LeaseCompareAndSwap ? [new string('b', 40), new string('c', 40)] : null,
+            "probe evidence");
 
     private sealed class FixedClock(DateTimeOffset utcNow) : IClock
     {
@@ -162,7 +165,7 @@ public sealed class GitHubAdapterTests
         public Task<ActiveProbeResult?> ExecuteActiveAsync(ActiveProbeRequest request, CancellationToken cancellationToken)
         {
             Requests.Add(request);
-            var result = ActiveResult ?? new ActiveProbeResult("evidence-id", request.ExpectedTargetCommit, request.ExpectedHead, request.Reference, request.ExpectedParent, request.Contenders, request.Evidence);
+            var result = ActiveResult ?? new ActiveProbeResult("evidence-id", request.ExpectedTargetCommit, request.ExpectedHead, request.Reference, request.ExpectedParent, request.Contenders, request.Evidence is null ? null : ActiveProbeEvidence.Digest(request.Evidence));
             return ActiveException is null ? Task.FromResult<ActiveProbeResult?>(result) : Task.FromException<ActiveProbeResult?>(ActiveException);
         }
     }

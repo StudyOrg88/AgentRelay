@@ -149,13 +149,14 @@ public sealed class AllowlistedGitHubApi : IGitHubApi, IActiveGitHubApi
             throw new GitHubApiException("reviewed_head_mismatch");
         if (request.Action == ActiveProbeAction.LeaseCompareAndSwap &&
             (result.Reference != request.Reference || result.ExpectedParent != request.ExpectedParent || result.Contenders is null ||
-             !result.Contenders.SequenceEqual(request.Contenders ?? []) || string.IsNullOrWhiteSpace(result.Evidence)))
+             !result.Contenders.SequenceEqual(request.Contenders ?? []) ||
+             !StringComparer.Ordinal.Equals(result.Evidence, ActiveProbeEvidence.Digest(request.Evidence ?? string.Empty))))
             throw new GitHubApiException("active_action_evidence_invalid");
         if (request.Action == ActiveProbeAction.WorkerNegativePermission &&
-            (result.Reference != request.Reference || string.IsNullOrWhiteSpace(result.Evidence)))
+            (result.Reference != request.Reference || !StringComparer.Ordinal.Equals(result.Evidence, ActiveProbeEvidence.Digest(request.Evidence ?? string.Empty))))
             throw new GitHubApiException("active_action_evidence_invalid");
         if (request.Action is ActiveProbeAction.NativeReview or ActiveProbeAction.GateCheck &&
-            !StringComparer.Ordinal.Equals(result.Evidence, request.Evidence))
+            !StringComparer.Ordinal.Equals(result.Evidence, ActiveProbeEvidence.Digest(request.Evidence ?? string.Empty)))
             throw new GitHubApiException("active_action_evidence_invalid");
     }
 

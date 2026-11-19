@@ -42,7 +42,13 @@ public static class GateCli
             if (authorization is null || !authorization.AllowActiveProbe || authorization.ExpiresAt <= DateTimeOffset.UtcNow ||
                 !StringComparer.Ordinal.Equals(authorization.Repository, request.Repository) || authorization.PullRequest != pullRequest ||
                 !StringComparer.OrdinalIgnoreCase.Equals(authorization.ExpectedHead, parsed.Single("expected-head")) ||
-                !StringComparer.Ordinal.Equals(authorization.TaskId, parsed.Single("test-task")))
+                !StringComparer.Ordinal.Equals(authorization.TaskId, parsed.Single("test-task")) ||
+                authorization.AllowedActions is not { Count: 1 } || !authorization.AllowedActions.Contains(action) ||
+                !StringComparer.OrdinalIgnoreCase.Equals(authorization.ExpectedTargetCommit, parsed.Single("active-target")) ||
+                !StringComparer.Ordinal.Equals(authorization.ExpectedReference, parsed.Single("active-ref")) ||
+                !StringComparer.OrdinalIgnoreCase.Equals(authorization.ExpectedParent, parsed.Single("expected-parent")) ||
+                !(authorization.ExpectedContenders ?? []).SequenceEqual(ParseContenders(parsed.Single("contenders")) ?? [], StringComparer.OrdinalIgnoreCase) ||
+                !StringComparer.Ordinal.Equals(authorization.Evidence, parsed.Single("evidence")))
                 return await WriteAsync(output, 3, "BLOCKED", ["authorization_mismatch"]);
             if (dependencies.GitHub is not IActiveGitHubApi activeApi)
                 return await WriteAsync(output, 3, "BLOCKED", ["active_probe_not_configured"]);

@@ -51,7 +51,8 @@ public sealed class GateCliTests
             "merge-app",
             "worker-app",
             "orchestrator-app",
-            head);
+            head,
+            Evidence: "test evidence");
         await File.WriteAllTextAsync(path, JsonSerializer.Serialize(authorization));
         var api = new RecordingActiveApi();
         var output = new StringWriter();
