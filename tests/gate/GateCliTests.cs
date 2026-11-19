@@ -25,7 +25,7 @@ public sealed class GateCliTests
         var path = Path.GetTempFileName();
         await File.WriteAllTextAsync(path, JsonSerializer.Serialize(new ActiveProbeAuthorization("other/repo", 4, new string('a', 40), DateTimeOffset.UtcNow.AddMinutes(10), true, "v2-test")));
         var output = new StringWriter();
-        var args = new[] { "probe", "--repo", "example/test-repo", "--base", "main", "--expected-check", "build", "--reviewer-app", "reviewer", "--gate-app", "gate", "--merge-app", "merge", "--active", "--test-task", "v2-test", "--test-pr", "4", "--expected-head", new string('a', 40), "--authorization-file", path, "--active-action", "native-review", "--active-identity", "reviewer", "--active-target", new string('a', 40) };
+        var args = new[] { "probe", "--repo", "example/test-repo", "--base", "main", "--expected-check", "build", "--reviewer-app", "reviewer", "--gate-app", "gate", "--merge-app", "merge", "--active", "--test-task", "v2-test", "--test-pr", "4", "--expected-head", new string('a', 40), "--authorization-file", path, "--active-action", "native-review", "--active-identity", "reviewer", "--active-target", new string('a', 40), "--evidence", "test evidence" };
 
         var exit = await GateCli.RunAsync(args, new GateDependencies(new NoopApi(), TextWriter.Null), output, TextWriter.Null, CancellationToken.None);
 
@@ -60,7 +60,7 @@ public sealed class GateCliTests
             "probe", "--repo", AllowlistedGitHubApi.SandboxRepository, "--base", "main", "--expected-check", "build",
             "--reviewer-app", "reviewer-app", "--gate-app", "gate-app", "--merge-app", "merge-app", "--active",
             "--test-task", "v2-test", "--test-pr", "4", "--expected-head", head, "--authorization-file", path,
-            "--active-action", "native-review", "--active-identity", "reviewer-app", "--active-target", head
+            "--active-action", "native-review", "--active-identity", "reviewer-app", "--active-target", head, "--evidence", "test evidence"
         };
 
         var exit = await GateCli.RunAsync(args, new GateDependencies(api, TextWriter.Null), output, TextWriter.Null, CancellationToken.None);

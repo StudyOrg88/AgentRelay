@@ -61,9 +61,36 @@ public sealed record ActiveProbeRequest(
     string ExpectedHead,
     string ExpectedTargetCommit,
     ActiveProbeAction Action,
-    string Identity);
+    string Identity,
+    string? Reference = null,
+    string? ExpectedParent = null,
+    IReadOnlyList<string>? Contenders = null,
+    string? Evidence = null);
 
-public sealed record ActiveProbeResult(string EvidenceId, string TargetCommit, string ReviewedHead);
+public sealed record ActiveProbeResult(
+    string EvidenceId,
+    string TargetCommit,
+    string ReviewedHead,
+    string? Reference = null,
+    string? ExpectedParent = null,
+    IReadOnlyList<string>? Contenders = null,
+    string? Evidence = null);
+
+public sealed record StageOneGitHubConfig(
+    long RepositoryId,
+    int PullRequest,
+    string HeadSha,
+    string TestMergeSha,
+    string RequiredCheck,
+    long RequiredCheckAppId,
+    long RulesetId,
+    long ReviewerAppId,
+    long GateAppId,
+    long MergeAppId,
+    long WorkerAppId,
+    long OrchestratorAppId,
+    string ControlReference,
+    string LeaseReference);
 
 public sealed record ProcessResult(int ExitCode, string StandardOutput, string StandardError);
 

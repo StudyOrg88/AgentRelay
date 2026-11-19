@@ -27,7 +27,7 @@ public sealed class GitHubApiException : Exception
 
 public sealed class GitHubTransportException : Exception
 {
-    public GitHubTransportException(string message, int? statusCode = null) : base(message) => StatusCode = statusCode;
+    public GitHubTransportException(string message, int? statusCode = null) : base("GitHub transport failed.") => StatusCode = statusCode;
     public int? StatusCode { get; }
 }
 
@@ -147,6 +147,16 @@ public sealed class AllowlistedGitHubApi : IGitHubApi, IActiveGitHubApi
             throw new GitHubApiException("reviewed_head_invalid");
         if (!StringComparer.OrdinalIgnoreCase.Equals(result.ReviewedHead, request.ExpectedHead))
             throw new GitHubApiException("reviewed_head_mismatch");
+        if (request.Action == ActiveProbeAction.LeaseCompareAndSwap &&
+            (result.Reference != request.Reference || result.ExpectedParent != request.ExpectedParent || result.Contenders is null ||
+             !result.Contenders.SequenceEqual(request.Contenders ?? []) || string.IsNullOrWhiteSpace(result.Evidence)))
+            throw new GitHubApiException("active_action_evidence_invalid");
+        if (request.Action == ActiveProbeAction.WorkerNegativePermission &&
+            (result.Reference != request.Reference || string.IsNullOrWhiteSpace(result.Evidence)))
+            throw new GitHubApiException("active_action_evidence_invalid");
+        if (request.Action is ActiveProbeAction.NativeReview or ActiveProbeAction.GateCheck &&
+            !StringComparer.Ordinal.Equals(result.Evidence, request.Evidence))
+            throw new GitHubApiException("active_action_evidence_invalid");
     }
 
     private static bool IsFullSha(string value) => value.Length == 40 && value.All(Uri.IsHexDigit);

@@ -16,6 +16,12 @@ param(
     [string] $ActiveAction,
     [string] $ActiveIdentity,
     [string] $ActiveTarget,
+    [string] $ActiveEvidence,
+    [string] $ActiveReference,
+    [string] $ExpectedParent,
+    [string[]] $Contenders = @(),
+    [string] $StageOneConfig,
+    [switch] $LiveSandbox,
     [switch] $Execute
 )
 
@@ -29,15 +35,32 @@ $arguments.AddRange([string[]]@('run', '--project', 'src/AgentRelay.Gate', '--',
 foreach ($check in $ExpectedChecks) { $arguments.Add('--expected-check'); $arguments.Add($check) }
 $arguments.AddRange([string[]]@('--reviewer-app', $ReviewerApp, '--gate-app', $GateApp, '--merge-app', $MergeApp))
 
+if ($Execute) {
+    if (-not $LiveSandbox -or -not $StageOneConfig -or -not (Test-Path -LiteralPath $StageOneConfig -PathType Leaf)) { throw 'Execution requires explicit -LiveSandbox and an existing stage-one config file.' }
+    $arguments.AddRange([string[]]@('--live-sandbox', '--stage-one-config', (Resolve-Path -LiteralPath $StageOneConfig).Path))
+}
+
 if ($Active) {
     if (-not $TestTask -or $TestPr -le 0 -or $ExpectedHead -notmatch '^[0-9a-fA-F]{40}$' -or -not $AuthorizationFile -or -not $ActiveAction -or -not $ActiveIdentity -or $ActiveTarget -notmatch '^[0-9a-fA-F]{40}$') {
         throw 'Active probe requires test task, test PR, full expected HEAD, authorization file, exact action, identity, and target commit.'
     }
     if (-not (Test-Path -LiteralPath $AuthorizationFile -PathType Leaf)) { throw 'Authorization file does not exist.' }
     $arguments.AddRange([string[]]@('--active', '--test-task', $TestTask, '--test-pr', [string]$TestPr, '--expected-head', $ExpectedHead, '--authorization-file', (Resolve-Path -LiteralPath $AuthorizationFile).Path, '--active-action', $ActiveAction, '--active-identity', $ActiveIdentity, '--active-target', $ActiveTarget))
+    if ($ActiveAction -in @('native-review', 'gate-check')) {
+        if (-not $ActiveEvidence) { throw 'Review and gate-check actions require explicit evidence text.' }
+        $arguments.AddRange([string[]]@('--evidence', $ActiveEvidence))
+    }
+    if ($ActiveAction -eq 'lease-compare-and-swap') {
+        if ($ActiveReference -ne 'refs/heads/agentrelay-locks/v2_bootstrap_probe' -or $ExpectedParent -notmatch '^[0-9a-fA-F]{40}$' -or $Contenders.Count -ne 2 -or $Contenders.Where({ $_ -notmatch '^[0-9a-fA-F]{40}$' }).Count -gt 0) { throw 'Lease CAS requires the fixed lease ref, full expected parent, and exactly two full-SHA contenders.' }
+        $arguments.AddRange([string[]]@('--active-ref', $ActiveReference, '--expected-parent', $ExpectedParent, '--contenders', ($Contenders -join ',')))
+    }
+    if ($ActiveAction -eq 'worker-negative-permission') {
+        if ($ActiveReference -ne 'refs/heads/agentrelay-control') { throw 'Worker negative permission evidence is limited to the fixed control ref.' }
+        $arguments.AddRange([string[]]@('--active-ref', $ActiveReference))
+    }
 }
 
-$tokenName = if (-not $Active) { 'AGENTRELAY_TOKEN_ORCHESTRATOR' } else {
+$tokenName = if (-not $Active) { 'AGENTRELAY_TOKEN_SANDBOX_CONFIG' } else {
     switch ($ActiveAction) {
         'native-review' { 'AGENTRELAY_TOKEN_REVIEWER' }
         'gate-check' { 'AGENTRELAY_TOKEN_GATE' }
@@ -48,7 +71,7 @@ $tokenName = if (-not $Active) { 'AGENTRELAY_TOKEN_ORCHESTRATOR' } else {
 }
 
 if (-not $Execute) {
-    [pscustomobject]@{ status = 'DRY_RUN'; repository = $Repository; active = [bool]$Active; credentialVariable = $tokenName; arguments = [string[]]$arguments } | ConvertTo-Json -Depth 4
+    [pscustomobject]@{ status = 'DRY_RUN'; repository = $Repository; active = [bool]$Active; liveEnabled = [bool]$LiveSandbox; credentialVariable = $tokenName; arguments = [string[]]$arguments } | ConvertTo-Json -Depth 4
     return
 }
 

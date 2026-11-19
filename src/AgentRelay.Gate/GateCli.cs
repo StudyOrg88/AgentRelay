@@ -11,12 +11,12 @@ public static class GateCli
     {
         if (args.Length == 0 || args[0] is "--help" or "-h")
         {
-            await output.WriteLineAsync("Usage: agentrelay-gate probe --repo owner/repo --base ref --expected-check name --reviewer-app app --gate-app app --merge-app app [--active --test-task id --test-pr n --expected-head sha --authorization-file path --active-action action --active-identity identity --active-target sha]");
+            await output.WriteLineAsync("Usage: agentrelay-gate probe --repo owner/repo --base ref --expected-check name --reviewer-app app --gate-app app --merge-app app [--live-sandbox --stage-one-config path] [--active --test-task id --test-pr n --expected-head sha --authorization-file path --active-action action --active-identity identity --active-target sha --evidence text --active-ref ref --expected-parent sha --contenders sha,sha]");
             return 0;
         }
 
         if (!StringComparer.Ordinal.Equals(args[0], "probe")) return await WriteAsync(output, 2, "BLOCKED", ["unknown_command"]);
-        var parsed = Parse(args.Skip(1).ToArray());
+        var parsed = Parse(RemoveRuntimeOptions(args.Skip(1).ToArray()));
         if (!parsed.Success) return await WriteAsync(output, 2, "BLOCKED", ["invalid_arguments"]);
 
         var required = new[] { "repo", "base", "reviewer-app", "gate-app", "merge-app" };
@@ -30,6 +30,14 @@ public static class GateCli
             if (activeKeys.Any(key => string.IsNullOrWhiteSpace(parsed.Single(key)))) return await WriteAsync(output, 2, "BLOCKED", ["active_probe_requires_binding"]);
             if (!int.TryParse(parsed.Single("test-pr"), out var pullRequest) || !IsFullSha(parsed.Single("expected-head")!) || !IsFullSha(parsed.Single("active-target")!)) return await WriteAsync(output, 2, "BLOCKED", ["active_probe_requires_binding"]);
             if (!TryParseAction(parsed.Single("active-action")!, out var action)) return await WriteAsync(output, 2, "BLOCKED", ["active_probe_requires_binding"]);
+            var actionArgumentsValid = action switch
+            {
+                ActiveProbeAction.NativeReview or ActiveProbeAction.GateCheck => !string.IsNullOrWhiteSpace(parsed.Single("evidence")),
+                ActiveProbeAction.LeaseCompareAndSwap => parsed.Single("active-ref") == "refs/heads/agentrelay-locks/v2_bootstrap_probe" && IsFullSha(parsed.Single("expected-parent")) && ParseContenders(parsed.Single("contenders")) is { Count: 2 } contenders && contenders.All(IsFullSha),
+                ActiveProbeAction.WorkerNegativePermission => parsed.Single("active-ref") == "refs/heads/agentrelay-control" && !string.IsNullOrWhiteSpace(parsed.Single("evidence")),
+                _ => false
+            };
+            if (!actionArgumentsValid) return await WriteAsync(output, 2, "BLOCKED", ["active_action_arguments_invalid"]);
             var authorization = await ReadAuthorizationAsync(parsed.Single("authorization-file")!, cancellationToken).ConfigureAwait(false);
             if (authorization is null || !authorization.AllowActiveProbe || authorization.ExpiresAt <= DateTimeOffset.UtcNow ||
                 !StringComparer.Ordinal.Equals(authorization.Repository, request.Repository) || authorization.PullRequest != pullRequest ||
@@ -46,7 +54,11 @@ public static class GateCli
                 parsed.Single("expected-head")!,
                 parsed.Single("active-target")!,
                 action,
-                parsed.Single("active-identity")!);
+                parsed.Single("active-identity")!,
+                parsed.Single("active-ref"),
+                parsed.Single("expected-parent"),
+                ParseContenders(parsed.Single("contenders")),
+                parsed.Single("evidence"));
             try
             {
                 var activeResult = await activeApi.ExecuteActiveAsync(activeRequest, authorization, cancellationToken).ConfigureAwait(false);
@@ -72,7 +84,7 @@ public static class GateCli
         catch (Exception) when (!cancellationToken.IsCancellationRequested) { return null; }
     }
 
-    private static bool IsFullSha(string value) => value.Length == 40 && value.All(Uri.IsHexDigit);
+    private static bool IsFullSha(string? value) => value is { Length: 40 } && value.All(Uri.IsHexDigit);
 
     private static bool TryParseAction(string value, out ActiveProbeAction action)
     {
@@ -86,6 +98,9 @@ public static class GateCli
         };
         return value is "native-review" or "gate-check" or "lease-compare-and-swap" or "worker-negative-permission";
     }
+
+    private static IReadOnlyList<string>? ParseContenders(string? value)
+        => string.IsNullOrWhiteSpace(value) ? null : value.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
 
     private static JsonSerializerOptions CreateJsonOptions()
     {
@@ -106,7 +121,16 @@ public static class GateCli
         {
             status = "ACTIVE_COMPLETED",
             action = request.Action,
-            evidence = new { id = result.EvidenceId, targetCommit = result.TargetCommit, reviewedHead = result.ReviewedHead }
+            evidence = new
+            {
+                id = result.EvidenceId,
+                targetCommit = result.TargetCommit,
+                reviewedHead = result.ReviewedHead,
+                reference = result.Reference,
+                expectedParent = result.ExpectedParent,
+                contenders = result.Contenders,
+                details = result.Evidence
+            }
         }, JsonOptions));
         return 0;
     }
@@ -125,6 +149,18 @@ public static class GateCli
             list.Add(args[index]);
         }
         return new(true, values, flags);
+    }
+
+    private static string[] RemoveRuntimeOptions(string[] args)
+    {
+        var result = new List<string>();
+        for (var index = 0; index < args.Length; index++)
+        {
+            if (args[index] == "--live-sandbox") continue;
+            if (args[index] == "--stage-one-config") { index++; continue; }
+            result.Add(args[index]);
+        }
+        return result.ToArray();
     }
 
     private sealed record ParsedArguments(bool Success, Dictionary<string, List<string>> Values, HashSet<string> Flags)
