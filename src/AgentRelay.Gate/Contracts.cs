@@ -43,7 +43,8 @@ public sealed record ActiveProbeAuthorization(
     string? GateIdentity = null,
     string? MergeIdentity = null,
     string? WorkerIdentity = null,
-    string? OrchestratorIdentity = null);
+    string? OrchestratorIdentity = null,
+    string? ExpectedTargetCommit = null);
 
 public enum ActiveProbeAction
 {
@@ -58,10 +59,11 @@ public sealed record ActiveProbeRequest(
     string TaskId,
     int PullRequest,
     string ExpectedHead,
+    string ExpectedTargetCommit,
     ActiveProbeAction Action,
     string Identity);
 
-public sealed record ActiveProbeResult(string EvidenceId, string TargetCommit);
+public sealed record ActiveProbeResult(string EvidenceId, string TargetCommit, string ReviewedHead);
 
 public sealed record ProcessResult(int ExitCode, string StandardOutput, string StandardError);
 

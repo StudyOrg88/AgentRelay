@@ -25,7 +25,7 @@ public sealed class GateCliTests
         var path = Path.GetTempFileName();
         await File.WriteAllTextAsync(path, JsonSerializer.Serialize(new ActiveProbeAuthorization("other/repo", 4, new string('a', 40), DateTimeOffset.UtcNow.AddMinutes(10), true, "v2-test")));
         var output = new StringWriter();
-        var args = new[] { "probe", "--repo", "example/test-repo", "--base", "main", "--expected-check", "build", "--reviewer-app", "reviewer", "--gate-app", "gate", "--merge-app", "merge", "--active", "--test-task", "v2-test", "--test-pr", "4", "--expected-head", new string('a', 40), "--authorization-file", path, "--active-action", "native-review", "--active-identity", "reviewer" };
+        var args = new[] { "probe", "--repo", "example/test-repo", "--base", "main", "--expected-check", "build", "--reviewer-app", "reviewer", "--gate-app", "gate", "--merge-app", "merge", "--active", "--test-task", "v2-test", "--test-pr", "4", "--expected-head", new string('a', 40), "--authorization-file", path, "--active-action", "native-review", "--active-identity", "reviewer", "--active-target", new string('a', 40) };
 
         var exit = await GateCli.RunAsync(args, new GateDependencies(new NoopApi(), TextWriter.Null), output, TextWriter.Null, CancellationToken.None);
 
@@ -50,7 +50,8 @@ public sealed class GateCliTests
             "gate-app",
             "merge-app",
             "worker-app",
-            "orchestrator-app");
+            "orchestrator-app",
+            head);
         await File.WriteAllTextAsync(path, JsonSerializer.Serialize(authorization));
         var api = new RecordingActiveApi();
         var output = new StringWriter();
@@ -59,13 +60,17 @@ public sealed class GateCliTests
             "probe", "--repo", AllowlistedGitHubApi.SandboxRepository, "--base", "main", "--expected-check", "build",
             "--reviewer-app", "reviewer-app", "--gate-app", "gate-app", "--merge-app", "merge-app", "--active",
             "--test-task", "v2-test", "--test-pr", "4", "--expected-head", head, "--authorization-file", path,
-            "--active-action", "native-review", "--active-identity", "reviewer-app"
+            "--active-action", "native-review", "--active-identity", "reviewer-app", "--active-target", head
         };
 
         var exit = await GateCli.RunAsync(args, new GateDependencies(api, TextWriter.Null), output, TextWriter.Null, CancellationToken.None);
 
         Assert.Equal(0, exit);
-        Assert.Contains("ACTIVE_COMPLETED", output.ToString());
+        using var document = JsonDocument.Parse(output.ToString());
+        Assert.Equal("ACTIVE_COMPLETED", document.RootElement.GetProperty("status").GetString());
+        Assert.Equal("review-id", document.RootElement.GetProperty("evidence").GetProperty("id").GetString());
+        Assert.Equal(head, document.RootElement.GetProperty("evidence").GetProperty("targetCommit").GetString());
+        Assert.Equal(head, document.RootElement.GetProperty("evidence").GetProperty("reviewedHead").GetString());
         var request = Assert.Single(api.Requests);
         Assert.Equal(ActiveProbeAction.NativeReview, request.Action);
         Assert.Equal("reviewer-app", request.Identity);
@@ -110,7 +115,7 @@ public sealed class GateCliTests
         public Task<ActiveProbeResult> ExecuteActiveAsync(ActiveProbeRequest request, ActiveProbeAuthorization authorization, CancellationToken cancellationToken)
         {
             Requests.Add(request);
-            return Task.FromResult(new ActiveProbeResult("review-id", request.ExpectedHead));
+            return Task.FromResult(new ActiveProbeResult("review-id", request.ExpectedTargetCommit, request.ExpectedHead));
         }
     }
 }

@@ -11,7 +11,7 @@ public static class GateCli
     {
         if (args.Length == 0 || args[0] is "--help" or "-h")
         {
-            await output.WriteLineAsync("Usage: agentrelay-gate probe --repo owner/repo --base ref --expected-check name --reviewer-app app --gate-app app --merge-app app [--active --test-task id --test-pr n --expected-head sha --authorization-file path --active-action action --active-identity identity]");
+            await output.WriteLineAsync("Usage: agentrelay-gate probe --repo owner/repo --base ref --expected-check name --reviewer-app app --gate-app app --merge-app app [--active --test-task id --test-pr n --expected-head sha --authorization-file path --active-action action --active-identity identity --active-target sha]");
             return 0;
         }
 
@@ -26,9 +26,9 @@ public static class GateCli
         var request = new BootstrapProbeRequest(parsed.Single("repo")!, parsed.Single("base")!, expectedChecks!, parsed.Single("reviewer-app")!, parsed.Single("gate-app")!, parsed.Single("merge-app")!);
         if (parsed.Flags.Contains("active"))
         {
-            var activeKeys = new[] { "test-task", "test-pr", "expected-head", "authorization-file", "active-action", "active-identity" };
+            var activeKeys = new[] { "test-task", "test-pr", "expected-head", "authorization-file", "active-action", "active-identity", "active-target" };
             if (activeKeys.Any(key => string.IsNullOrWhiteSpace(parsed.Single(key)))) return await WriteAsync(output, 2, "BLOCKED", ["active_probe_requires_binding"]);
-            if (!int.TryParse(parsed.Single("test-pr"), out var pullRequest) || !IsFullSha(parsed.Single("expected-head")!)) return await WriteAsync(output, 2, "BLOCKED", ["active_probe_requires_binding"]);
+            if (!int.TryParse(parsed.Single("test-pr"), out var pullRequest) || !IsFullSha(parsed.Single("expected-head")!) || !IsFullSha(parsed.Single("active-target")!)) return await WriteAsync(output, 2, "BLOCKED", ["active_probe_requires_binding"]);
             if (!TryParseAction(parsed.Single("active-action")!, out var action)) return await WriteAsync(output, 2, "BLOCKED", ["active_probe_requires_binding"]);
             var authorization = await ReadAuthorizationAsync(parsed.Single("authorization-file")!, cancellationToken).ConfigureAwait(false);
             if (authorization is null || !authorization.AllowActiveProbe || authorization.ExpiresAt <= DateTimeOffset.UtcNow ||
@@ -44,12 +44,13 @@ public static class GateCli
                 parsed.Single("test-task")!,
                 pullRequest,
                 parsed.Single("expected-head")!,
+                parsed.Single("active-target")!,
                 action,
                 parsed.Single("active-identity")!);
             try
             {
-                await activeApi.ExecuteActiveAsync(activeRequest, authorization, cancellationToken).ConfigureAwait(false);
-                return await WriteAsync(output, 0, "ACTIVE_COMPLETED", []);
+                var activeResult = await activeApi.ExecuteActiveAsync(activeRequest, authorization, cancellationToken).ConfigureAwait(false);
+                return await WriteActiveSuccessAsync(output, activeRequest, activeResult);
             }
             catch (GitHubApiException exception)
             {
@@ -97,6 +98,17 @@ public static class GateCli
     {
         await output.WriteLineAsync(JsonSerializer.Serialize(new { status, blockers }, JsonOptions));
         return exitCode;
+    }
+
+    private static async Task<int> WriteActiveSuccessAsync(TextWriter output, ActiveProbeRequest request, ActiveProbeResult result)
+    {
+        await output.WriteLineAsync(JsonSerializer.Serialize(new
+        {
+            status = "ACTIVE_COMPLETED",
+            action = request.Action,
+            evidence = new { id = result.EvidenceId, targetCommit = result.TargetCommit, reviewedHead = result.ReviewedHead }
+        }, JsonOptions));
+        return 0;
     }
 
     private static ParsedArguments Parse(string[] args)

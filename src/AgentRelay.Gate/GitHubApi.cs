@@ -86,8 +86,10 @@ public sealed class AllowlistedGitHubApi : IGitHubApi, IActiveGitHubApi
 
         try
         {
-            return await _transport.ExecuteActiveAsync(request, cancellationToken).ConfigureAwait(false)
+            var result = await _transport.ExecuteActiveAsync(request, cancellationToken).ConfigureAwait(false)
                 ?? throw new GitHubApiException("github_write_unavailable");
+            ValidateActiveResult(request, result);
+            return result;
         }
         catch (GitHubApiException) { throw; }
         catch (GitHubTransportException error)
@@ -109,7 +111,9 @@ public sealed class AllowlistedGitHubApi : IGitHubApi, IActiveGitHubApi
             !StringComparer.Ordinal.Equals(authorization.TaskId, request.TaskId) ||
             authorization.PullRequest != request.PullRequest ||
             !IsFullSha(request.ExpectedHead) ||
-            !StringComparer.OrdinalIgnoreCase.Equals(authorization.ExpectedHead, request.ExpectedHead))
+            !StringComparer.OrdinalIgnoreCase.Equals(authorization.ExpectedHead, request.ExpectedHead) ||
+            !IsFullSha(request.ExpectedTargetCommit) ||
+            !StringComparer.OrdinalIgnoreCase.Equals(authorization.ExpectedTargetCommit, request.ExpectedTargetCommit))
             throw new GitHubApiException("authorization_mismatch");
 
         if (authorization.ExpiresAt <= _clock.UtcNow)
@@ -130,6 +134,20 @@ public sealed class AllowlistedGitHubApi : IGitHubApi, IActiveGitHubApi
         ActiveProbeAction.WorkerNegativePermission => authorization.WorkerIdentity,
         _ => null
     };
+
+    private static void ValidateActiveResult(ActiveProbeRequest request, ActiveProbeResult result)
+    {
+        if (string.IsNullOrWhiteSpace(result.EvidenceId))
+            throw new GitHubApiException("active_evidence_invalid");
+        if (!IsFullSha(result.TargetCommit))
+            throw new GitHubApiException("active_target_invalid");
+        if (!StringComparer.OrdinalIgnoreCase.Equals(result.TargetCommit, request.ExpectedTargetCommit))
+            throw new GitHubApiException("active_target_mismatch");
+        if (!IsFullSha(result.ReviewedHead))
+            throw new GitHubApiException("reviewed_head_invalid");
+        if (!StringComparer.OrdinalIgnoreCase.Equals(result.ReviewedHead, request.ExpectedHead))
+            throw new GitHubApiException("reviewed_head_mismatch");
+    }
 
     private static bool IsFullSha(string value) => value.Length == 40 && value.All(Uri.IsHexDigit);
 }

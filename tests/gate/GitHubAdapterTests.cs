@@ -61,7 +61,7 @@ public sealed class GitHubAdapterTests
     [Fact]
     public async Task AuthorizedNativeReviewUsesOnlyBoundOperation()
     {
-        var transport = new RecordingBootstrapTransport { ActiveResult = new ActiveProbeResult("review-id", Head) };
+        var transport = new RecordingBootstrapTransport { ActiveResult = new ActiveProbeResult("review-id", Head, Head) };
         var api = new AllowlistedGitHubApi(transport, new FixedClock(Now));
 
         var result = await api.ExecuteActiveAsync(ActiveRequest(), ValidAuthorization(), CancellationToken.None);
@@ -75,6 +75,27 @@ public sealed class GitHubAdapterTests
         Assert.Equal("reviewer-app", request.Identity);
     }
 
+    public static IEnumerable<object[]> InvalidActiveResults()
+    {
+        yield return [new ActiveProbeResult("", Head, Head), "active_evidence_invalid"];
+        yield return [new ActiveProbeResult("evidence-id", "abc123", Head), "active_target_invalid"];
+        yield return [new ActiveProbeResult("evidence-id", new string('b', 40), Head), "active_target_mismatch"];
+        yield return [new ActiveProbeResult("evidence-id", Head, "abc123"), "reviewed_head_invalid"];
+        yield return [new ActiveProbeResult("evidence-id", Head, new string('b', 40)), "reviewed_head_mismatch"];
+    }
+
+    [Theory]
+    [MemberData(nameof(InvalidActiveResults))]
+    public async Task ActiveResultMustContainBoundVerifiableEvidence(ActiveProbeResult activeResult, string reason)
+    {
+        var transport = new RecordingBootstrapTransport { ActiveResult = activeResult };
+        var api = new AllowlistedGitHubApi(transport, new FixedClock(Now));
+
+        var error = await Assert.ThrowsAsync<GitHubApiException>(() => api.ExecuteActiveAsync(ActiveRequest(), ValidAuthorization(), CancellationToken.None));
+
+        Assert.Equal(reason, error.SafeReason);
+    }
+
     [Theory]
     [InlineData(ActiveProbeAction.NativeReview, "reviewer-app")]
     [InlineData(ActiveProbeAction.GateCheck, "gate-app")]
@@ -82,7 +103,7 @@ public sealed class GitHubAdapterTests
     [InlineData(ActiveProbeAction.WorkerNegativePermission, "worker-app")]
     public async Task EachActionRequiresItsBoundIdentity(ActiveProbeAction action, string identity)
     {
-        var transport = new RecordingBootstrapTransport { ActiveResult = new ActiveProbeResult("evidence-id", Head) };
+        var transport = new RecordingBootstrapTransport { ActiveResult = new ActiveProbeResult("evidence-id", Head, Head) };
         var api = new AllowlistedGitHubApi(transport, new FixedClock(Now));
         var request = ActiveRequest() with { Action = action, Identity = identity };
 
@@ -108,12 +129,12 @@ public sealed class GitHubAdapterTests
         => new(Sandbox, "main", ["sandbox-contract"], "reviewer-app", "gate-app", "merge-app");
 
     private static ActiveProbeRequest ActiveRequest()
-        => new(Sandbox, "v2_bootstrap_probe", 1, Head, ActiveProbeAction.NativeReview, "reviewer-app");
+        => new(Sandbox, "v2_bootstrap_probe", 1, Head, Head, ActiveProbeAction.NativeReview, "reviewer-app");
 
     private static ActiveProbeAuthorization ValidAuthorization()
         => new(Sandbox, 1, Head, Now.AddMinutes(30), true, "v2_bootstrap_probe",
             [ActiveProbeAction.NativeReview, ActiveProbeAction.GateCheck, ActiveProbeAction.LeaseCompareAndSwap, ActiveProbeAction.WorkerNegativePermission],
-            "reviewer-app", "gate-app", "merge-app", "worker-app", "orchestrator-app");
+            "reviewer-app", "gate-app", "merge-app", "worker-app", "orchestrator-app", Head);
 
     private sealed class FixedClock(DateTimeOffset utcNow) : IClock
     {
