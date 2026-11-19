@@ -48,7 +48,7 @@ public sealed class GitHubRestBootstrapTransport : IGitHubBootstrapTransport
         var rulesets = await GetJsonAsync($"repos/{AllowlistedGitHubApi.SandboxRepository}/rulesets?per_page=100", cancellationToken).ConfigureAwait(false);
         var mergeQueueEnabled = rulesets.EnumerateArray().Any(ruleSet => ruleSet.GetProperty("rules").EnumerateArray().Any(rule => rule.GetProperty("type").GetString() == "merge_queue"));
         var installations = await GetJsonAsync($"repos/{AllowlistedGitHubApi.SandboxRepository}/installations?per_page=100", cancellationToken).ConfigureAwait(false);
-        ValidateRoleInstallations(installations);
+        await ValidateRoleInstallationsAsync(installations, cancellationToken).ConfigureAwait(false);
 
         return new BootstrapEvidence(
             PermissionsKnown: true,
@@ -184,7 +184,7 @@ public sealed class GitHubRestBootstrapTransport : IGitHubBootstrapTransport
 
     private async Task<ActiveProbeResult> CompareAndSwapAsync(ActiveProbeRequest request, CancellationToken cancellationToken)
     {
-        if (request.Reference != _config.LeaseReference || string.IsNullOrWhiteSpace(request.Evidence) || !IsSha(request.ExpectedParent) || request.Contenders is not { Count: 2 } contenders || contenders.Any(item => !IsSha(item)) || contenders[0] == contenders[1])
+        if (request.Reference != _config.LeaseReference || string.IsNullOrWhiteSpace(request.Evidence) || !IsSha(request.ExpectedParent) || request.Contenders is not { Count: 2 } contenders || contenders.Any(item => !IsSha(item)) || StringComparer.OrdinalIgnoreCase.Equals(contenders[0], contenders[1]))
             throw Failure(HttpStatusCode.Forbidden);
 
         var reference = ToApiRef(request.Reference);
@@ -193,26 +193,25 @@ public sealed class GitHubRestBootstrapTransport : IGitHubBootstrapTransport
         foreach (var contender in contenders)
         {
             var commit = await GetJsonAsync($"repos/{AllowlistedGitHubApi.SandboxRepository}/git/commits/{contender}", cancellationToken).ConfigureAwait(false);
-            Require(commit.GetProperty("parents").EnumerateArray().Any(parent => StringComparer.OrdinalIgnoreCase.Equals(parent.GetProperty("sha").GetString(), request.ExpectedParent)));
+            var parents = commit.GetProperty("parents").EnumerateArray().ToArray();
+            Require(parents.Length == 1 && StringComparer.OrdinalIgnoreCase.Equals(parents[0].GetProperty("sha").GetString(), request.ExpectedParent));
         }
-        var outcomes = new List<(string Commit, bool Won)>();
-        foreach (var contender in contenders)
-        {
-            var body = JsonSerializer.Serialize(new { sha = contender, force = false });
-            using var response = await SendAsync(HttpMethod.Patch, $"repos/{AllowlistedGitHubApi.SandboxRepository}/git/refs/{reference}", body, cancellationToken).ConfigureAwait(false);
-            if (response.IsSuccessStatusCode)
-            {
-                using var document = await ReadSuccessfulJsonAsync(response, cancellationToken).ConfigureAwait(false);
-                outcomes.Add((contender, StringComparer.OrdinalIgnoreCase.Equals(document.RootElement.GetProperty("object").GetProperty("sha").GetString(), contender)));
-            }
-            else if (response.StatusCode is HttpStatusCode.Conflict or HttpStatusCode.UnprocessableEntity)
-                outcomes.Add((contender, false));
-            else
-                throw Failure(response.StatusCode);
-        }
+        var outcomes = await Task.WhenAll(contenders.Select(contender =>
+            CompareAndSwapContenderAsync(reference, contender, cancellationToken))).ConfigureAwait(false);
         Require(outcomes.Count(item => item.Won) == 1);
         return new ActiveProbeResult($"lease-cas:{string.Join(',', outcomes.Select(item => $"{item.Commit[..12]}={(item.Won ? "won" : "lost")}"))}", request.ExpectedTargetCommit, request.ExpectedHead,
             request.Reference, request.ExpectedParent, contenders, ActiveProbeEvidence.Digest(request.Evidence!));
+    }
+
+    private async Task<(string Commit, bool Won)> CompareAndSwapContenderAsync(string reference, string contender, CancellationToken cancellationToken)
+    {
+        var body = JsonSerializer.Serialize(new { sha = contender, force = false });
+        using var response = await SendAsync(HttpMethod.Patch, $"repos/{AllowlistedGitHubApi.SandboxRepository}/git/refs/{reference}", body, cancellationToken).ConfigureAwait(false);
+        if (response.StatusCode is HttpStatusCode.Conflict or HttpStatusCode.UnprocessableEntity)
+            return (contender, false);
+        using var document = await ReadSuccessfulJsonAsync(response, cancellationToken).ConfigureAwait(false);
+        Require(StringComparer.OrdinalIgnoreCase.Equals(document.RootElement.GetProperty("object").GetProperty("sha").GetString(), contender));
+        return (contender, true);
     }
 
     private async Task<ActiveProbeResult> ReadWorkerPermissionsAsync(ActiveProbeRequest request, CancellationToken cancellationToken)
@@ -222,29 +221,52 @@ public sealed class GitHubRestBootstrapTransport : IGitHubBootstrapTransport
         var repositories = installation.GetProperty("repositories").EnumerateArray().ToArray();
         Require(repositories.Length == 1 && repositories[0].GetProperty("id").GetInt64() == _config.RepositoryId && repositories[0].GetProperty("full_name").GetString() == AllowlistedGitHubApi.SandboxRepository);
         var permissions = repositories[0].GetProperty("permissions");
-        Require(permissions.GetProperty("contents").GetString() == "read" && permissions.GetProperty("pull_requests").GetString() == "read");
+        ValidateExactPermissions(permissions, new Dictionary<string, string>
+        {
+            ["metadata"] = "read",
+            ["contents"] = "read",
+            ["pull_requests"] = "read"
+        });
 
         var pr = await GetJsonAsync($"repos/{AllowlistedGitHubApi.SandboxRepository}/pulls/{_config.PullRequest}", cancellationToken).ConfigureAwait(false);
         Require(StringComparer.OrdinalIgnoreCase.Equals(pr.GetProperty("head").GetProperty("sha").GetString(), request.ExpectedHead));
-        var control = await GetOptionalJsonAsync($"repos/{AllowlistedGitHubApi.SandboxRepository}/git/ref/{ToApiRef(_config.ControlReference)}", cancellationToken).ConfigureAwait(false);
-        var lease = await GetOptionalJsonAsync($"repos/{AllowlistedGitHubApi.SandboxRepository}/git/ref/{ToApiRef(_config.LeaseReference)}", cancellationToken).ConfigureAwait(false);
-        Require(control is null && lease is null);
+        var ruleset = await GetJsonAsync($"repos/{AllowlistedGitHubApi.SandboxRepository}/rulesets/{_config.RulesetId}", cancellationToken).ConfigureAwait(false);
+        ValidateRuleset(ruleset);
+        var bypassActors = ruleset.GetProperty("bypass_actors").EnumerateArray().ToArray();
+        Require(!bypassActors.Any(actor => actor.GetProperty("actor_id").GetInt64() == _config.WorkerAppId));
+
         var reviewBody = JsonSerializer.Serialize(new { commit_id = request.ExpectedHead, body = $"AgentRelay worker permission probe sha256:{ActiveProbeEvidence.Digest(request.Evidence!)}" });
-        using var createAttempt = await SendAsync(HttpMethod.Post, $"repos/{AllowlistedGitHubApi.SandboxRepository}/pulls/{_config.PullRequest}/reviews", reviewBody, cancellationToken).ConfigureAwait(false);
-        var reviewWriteDenied = createAttempt.StatusCode == HttpStatusCode.Forbidden;
-        if (createAttempt.IsSuccessStatusCode)
+        await RequireReviewDeniedAsync($"repos/{AllowlistedGitHubApi.SandboxRepository}/pulls/{_config.PullRequest}/reviews", reviewBody, cancellationToken).ConfigureAwait(false);
+        var deniedSha = new string('0', 40);
+        var mergeBody = JsonSerializer.Serialize(new { sha = deniedSha, merge_method = "squash" });
+        await RequireForbiddenAsync(HttpMethod.Put, $"repos/{AllowlistedGitHubApi.SandboxRepository}/pulls/{_config.PullRequest}/merge", mergeBody, cancellationToken).ConfigureAwait(false);
+        var refBody = JsonSerializer.Serialize(new { sha = deniedSha, force = false });
+        await RequireForbiddenAsync(HttpMethod.Patch, $"repos/{AllowlistedGitHubApi.SandboxRepository}/git/refs/{ToApiRef(_config.ControlReference)}", refBody, cancellationToken).ConfigureAwait(false);
+        await RequireForbiddenAsync(HttpMethod.Patch, $"repos/{AllowlistedGitHubApi.SandboxRepository}/git/refs/{ToApiRef(_config.LeaseReference)}", refBody, cancellationToken).ConfigureAwait(false);
+        return new ActiveProbeResult($"worker-permissions:{_config.WorkerAppId}:contents=read,pull_requests=read,review-write=403,merge-write=403,control-ref-write=403,lease-ref-write=403,bypass=not-listed-in-active-ruleset", request.ExpectedTargetCommit, request.ExpectedHead,
+            request.Reference, Evidence: ActiveProbeEvidence.Digest(request.Evidence!));
+    }
+
+    private async Task RequireForbiddenAsync(HttpMethod method, string path, string body, CancellationToken cancellationToken)
+    {
+        using var response = await SendAsync(method, path, body, cancellationToken).ConfigureAwait(false);
+        Require(response.StatusCode == HttpStatusCode.Forbidden);
+    }
+
+    private async Task RequireReviewDeniedAsync(string path, string body, CancellationToken cancellationToken)
+    {
+        using var response = await SendAsync(HttpMethod.Post, path, body, cancellationToken).ConfigureAwait(false);
+        if (response.StatusCode == HttpStatusCode.Forbidden) return;
+        if (response.IsSuccessStatusCode)
         {
-            using var created = await ReadSuccessfulJsonAsync(createAttempt, cancellationToken).ConfigureAwait(false);
+            using var created = await ReadSuccessfulJsonAsync(response, cancellationToken).ConfigureAwait(false);
             var reviewId = created.RootElement.GetProperty("id").ToString();
-            using var cleanup = await SendAsync(HttpMethod.Delete, $"repos/{AllowlistedGitHubApi.SandboxRepository}/pulls/{_config.PullRequest}/reviews/{Uri.EscapeDataString(reviewId)}", null, cancellationToken).ConfigureAwait(false);
+            using var cleanup = await SendAsync(HttpMethod.Delete,
+                $"repos/{AllowlistedGitHubApi.SandboxRepository}/pulls/{_config.PullRequest}/reviews/{Uri.EscapeDataString(reviewId)}", null, cancellationToken).ConfigureAwait(false);
             if (!cleanup.IsSuccessStatusCode) throw Failure(cleanup.StatusCode);
             throw Failure(HttpStatusCode.Forbidden);
         }
-        if (!reviewWriteDenied)
-            throw Failure(createAttempt.StatusCode);
-        Require(!permissions.TryGetProperty("checks", out _) && !permissions.TryGetProperty("administration", out _));
-        return new ActiveProbeResult($"worker-permissions:{_config.WorkerAppId}:contents=read,pulls=read,checks=absent,administration=absent,merge=absent,bypass=absent,control-write=absent,lease-write=absent,review-write=403,pending-review=not-created", request.ExpectedTargetCommit, request.ExpectedHead,
-            request.Reference, Evidence: ActiveProbeEvidence.Digest(request.Evidence!));
+        throw Failure(response.StatusCode);
     }
 
     private async Task<JsonElement> GetJsonAsync(string path, CancellationToken cancellationToken)
@@ -292,26 +314,43 @@ public sealed class GitHubRestBootstrapTransport : IGitHubBootstrapTransport
         Require(new[] { "creation", "update", "deletion", "non_fast_forward" }.All(rules.Contains));
     }
 
-    private void ValidateRoleInstallations(JsonElement installations)
+    private async Task ValidateRoleInstallationsAsync(JsonElement installations, CancellationToken cancellationToken)
     {
         var items = installations.GetProperty("installations").EnumerateArray().ToArray();
-        ValidateInstallation(items, _config.ReviewerAppId, ("metadata", "read"), ("pull_requests", "write"));
-        ValidateInstallation(items, _config.GateAppId, ("metadata", "read"), ("contents", "read"), ("pull_requests", "read"), ("checks", "write"));
-        ValidateInstallation(items, _config.MergeAppId, ("metadata", "read"), ("contents", "write"), ("pull_requests", "write"));
-        ValidateInstallation(items, _config.WorkerAppId, ("metadata", "read"), ("contents", "read"), ("pull_requests", "read"));
-        ValidateInstallation(items, _config.OrchestratorAppId, ("metadata", "read"), ("contents", "write"));
+        var expected = new Dictionary<long, IReadOnlyDictionary<string, string>>
+        {
+            [_config.ReviewerAppId] = new Dictionary<string, string> { ["metadata"] = "read", ["pull_requests"] = "write" },
+            [_config.GateAppId] = new Dictionary<string, string> { ["metadata"] = "read", ["contents"] = "read", ["pull_requests"] = "read", ["checks"] = "write" },
+            [_config.MergeAppId] = new Dictionary<string, string> { ["metadata"] = "read", ["contents"] = "write", ["pull_requests"] = "write" },
+            [_config.WorkerAppId] = new Dictionary<string, string> { ["metadata"] = "read", ["contents"] = "read", ["pull_requests"] = "read" },
+            [_config.OrchestratorAppId] = new Dictionary<string, string> { ["metadata"] = "read", ["contents"] = "write" }
+        };
+        Require(items.Length == expected.Count);
+        foreach (var role in expected)
+        {
+            var matches = items.Where(item => item.GetProperty("app_id").GetInt64() == role.Key).ToArray();
+            Require(matches.Length == 1 && matches[0].GetProperty("repository_selection").GetString() == "selected");
+            var installationId = matches[0].GetProperty("id").GetInt64();
+            Require(installationId > 0);
+            ValidateExactPermissions(matches[0].GetProperty("permissions"), role.Value);
+            await ValidateInstallationScopeAsync(installationId, cancellationToken).ConfigureAwait(false);
+        }
     }
 
-    private void ValidateInstallation(JsonElement[] installations, long appId, params (string Name, string Permission)[] expectedPermissions)
+    private static void ValidateExactPermissions(JsonElement permissions, IReadOnlyDictionary<string, string> expected)
     {
-        var matches = installations.Where(installation => installation.GetProperty("app_id").GetInt64() == appId).ToArray();
-        Require(matches.Length == 1 && matches[0].GetProperty("repository_selection").GetString() == "selected");
-        var permissions = matches[0].GetProperty("permissions");
-        foreach (var expected in expectedPermissions)
-            Require(permissions.TryGetProperty(expected.Name, out var value) && value.GetString() == expected.Permission);
-        Require(!permissions.TryGetProperty("administration", out _) && !permissions.TryGetProperty("workflows", out _));
-        if (appId == _config.WorkerAppId)
-            Require(!permissions.TryGetProperty("checks", out _) && permissions.GetProperty("contents").GetString() == "read" && permissions.GetProperty("pull_requests").GetString() == "read");
+        var entries = permissions.EnumerateObject().ToArray();
+        Require(entries.Length == expected.Count && entries.All(entry =>
+            expected.TryGetValue(entry.Name, out var permission) && StringComparer.Ordinal.Equals(entry.Value.GetString(), permission)));
+    }
+
+    private async Task ValidateInstallationScopeAsync(long installationId, CancellationToken cancellationToken)
+    {
+        var scope = await GetJsonAsync($"app/installations/{installationId}/repositories?per_page=100", cancellationToken).ConfigureAwait(false);
+        var repositories = scope.GetProperty("repositories").EnumerateArray().ToArray();
+        Require(scope.GetProperty("total_count").GetInt32() == 1 && repositories.Length == 1 &&
+            repositories[0].GetProperty("id").GetInt64() == _config.RepositoryId &&
+            repositories[0].GetProperty("full_name").GetString() == AllowlistedGitHubApi.SandboxRepository);
     }
 
     private void EnsureActiveBinding(ActiveProbeRequest request)
