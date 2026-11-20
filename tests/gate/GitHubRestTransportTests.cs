@@ -36,6 +36,54 @@ public sealed class GitHubRestTransportTests
     }
 
     [Fact]
+    public void LiveReadOnlyTransportReadsConfigurationPatAndFiveDedicatedInstallationScopeCredentials()
+    {
+        var configPath = Path.GetTempFileName();
+        try
+        {
+            File.WriteAllText(configPath, JsonSerializer.Serialize(StageOneConfig()));
+            var values = ReadOnlyCredentialEnvironment();
+            var reads = new List<string>();
+
+            var api = Program.CreateGitHubApi(
+                ["--live-sandbox", "--stage-one-config", configPath],
+                name => { reads.Add(name); return values.GetValueOrDefault(name); });
+
+            Assert.IsType<AllowlistedGitHubApi>(api);
+            Assert.Equal(ReadOnlyCredentialNames(), reads);
+        }
+        finally
+        {
+            File.Delete(configPath);
+        }
+    }
+
+    [Theory]
+    [InlineData("AGENTRELAY_TOKEN_SANDBOX_CONFIG", "ghs_wrong-kind")]
+    [InlineData("AGENTRELAY_TOKEN_SANDBOX_SCOPE_GATE", "github_pat_wrong_kind")]
+    [InlineData("AGENTRELAY_TOKEN_SANDBOX_SCOPE_GATE", "ghs_reviewer_scope")]
+    public void LiveReadOnlyTransportFailsClosedOnWrongOrSharedCredentialKind(string variable, string replacement)
+    {
+        var configPath = Path.GetTempFileName();
+        try
+        {
+            File.WriteAllText(configPath, JsonSerializer.Serialize(StageOneConfig()));
+            var values = ReadOnlyCredentialEnvironment();
+            values[variable] = replacement;
+
+            var api = Program.CreateGitHubApi(
+                ["--live-sandbox", "--stage-one-config", configPath],
+                name => values.GetValueOrDefault(name));
+
+            Assert.IsType<FailClosedGitHubApi>(api);
+        }
+        finally
+        {
+            File.Delete(configPath);
+        }
+    }
+
+    [Fact]
     public void LiveActiveTransportDoesNotReadRoleTokenUntilStageTwoBindingIsValid()
     {
         var configPath = Path.GetTempFileName();
@@ -115,7 +163,7 @@ public sealed class GitHubRestTransportTests
     public async Task ReadOnlyVerifiesExactStageOneFactsAndSources()
     {
         var handler = new ScriptedHandler(ReadOnlyResponses());
-        var transport = new GitHubRestBootstrapTransport(new HttpClient(handler), "read-token", StageOneConfig());
+        var transport = ReadOnlyTransport(handler);
 
         var evidence = await transport.ReadEvidenceAsync(ReadRequest(), CancellationToken.None);
 
@@ -124,6 +172,14 @@ public sealed class GitHubRestTransportTests
         Assert.Equal(TestMerge, evidence.GateTargetCommit);
         Assert.All(handler.Requests, request => Assert.Equal("Bearer", request.Authorization?.Scheme));
         Assert.DoesNotContain(handler.Requests, request => request.Method != HttpMethod.Get);
+        Assert.Equal(5, handler.Requests.Count(request => request.Path == "/installation/repositories?per_page=100"));
+        Assert.DoesNotContain(handler.Requests, request => request.Path.StartsWith("/app/installations/", StringComparison.Ordinal));
+        Assert.Equal(InstallationScopeTokens().Values.Order(), handler.Requests
+            .Where(request => request.Path == "/installation/repositories?per_page=100")
+            .Select(request => request.Authorization?.Parameter)
+            .Order());
+        Assert.All(handler.Requests.Where(request => request.Path != "/installation/repositories?per_page=100"),
+            request => Assert.Equal("github_pat_config_read_only", request.Authorization?.Parameter));
     }
 
     [Theory]
@@ -136,7 +192,7 @@ public sealed class GitHubRestTransportTests
             HeadChecks(headCheck), MergeChecks(mergeCheck), strict,
             head: Head,
             mergeSha: TestMerge);
-        var transport = new GitHubRestBootstrapTransport(new HttpClient(new ScriptedHandler(responses)), "read-token", StageOneConfig());
+        var transport = ReadOnlyTransport(new ScriptedHandler(responses));
 
         var evidence = await transport.ReadEvidenceAsync(ReadRequest(), CancellationToken.None);
 
@@ -152,7 +208,7 @@ public sealed class GitHubRestTransportTests
         var responses = ReadOnlyResponses(
             HeadChecks(headCheck, appId, conclusion), MergeChecks(mergeCheck, appId, conclusion),
             strict: true, head: Head, mergeSha: TestMerge);
-        var transport = new GitHubRestBootstrapTransport(new HttpClient(new ScriptedHandler(responses)), "read-token", StageOneConfig());
+        var transport = ReadOnlyTransport(new ScriptedHandler(responses));
 
         var error = await Assert.ThrowsAsync<GitHubTransportException>(() => transport.ReadEvidenceAsync(ReadRequest(), CancellationToken.None));
 
@@ -164,7 +220,7 @@ public sealed class GitHubRestTransportTests
     {
         var shortRun = "[{\"name\":\"sandbox-contract\",\"status\":\"completed\",\"conclusion\":\"success\",\"head_sha\":\"" + TestMerge[..12] + "\",\"app\":{\"id\":15368}}]";
         var responses = ReadOnlyResponses(HeadChecks(false), shortRun, strict: true, head: Head, mergeSha: TestMerge);
-        var transport = new GitHubRestBootstrapTransport(new HttpClient(new ScriptedHandler(responses)), "read-token", StageOneConfig());
+        var transport = ReadOnlyTransport(new ScriptedHandler(responses));
 
         var error = await Assert.ThrowsAsync<GitHubTransportException>(() => transport.ReadEvidenceAsync(ReadRequest(), CancellationToken.None));
 
@@ -175,7 +231,7 @@ public sealed class GitHubRestTransportTests
     public async Task ReadOnlyFailsClosedOnForbiddenEmptyOrMismatchedFacts()
     {
         var responses = ReadOnlyResponses(HeadChecks(false), MergeChecks(true, 999), strict: true, head: Head, mergeSha: TestMerge);
-        var transport = new GitHubRestBootstrapTransport(new HttpClient(new ScriptedHandler(responses)), "read-token", StageOneConfig());
+        var transport = ReadOnlyTransport(new ScriptedHandler(responses));
 
         var error = await Assert.ThrowsAsync<GitHubTransportException>(() => transport.ReadEvidenceAsync(ReadRequest(), CancellationToken.None));
 
@@ -188,7 +244,7 @@ public sealed class GitHubRestTransportTests
     {
         var installations = InstallationsJson().Replace("\"pull_requests\":\"write\"}", "\"pull_requests\":\"write\",\"contents\":\"write\"}", StringComparison.Ordinal);
         var responses = ReadOnlyResponses(installations: installations);
-        var transport = new GitHubRestBootstrapTransport(new HttpClient(new ScriptedHandler(responses)), "read-token", StageOneConfig());
+        var transport = ReadOnlyTransport(new ScriptedHandler(responses));
 
         await Assert.ThrowsAsync<GitHubTransportException>(() => transport.ReadEvidenceAsync(ReadRequest(), CancellationToken.None));
     }
@@ -197,9 +253,9 @@ public sealed class GitHubRestTransportTests
     public async Task ReadOnlyRejectsRoleInstallationSelectedForMultipleRepositories()
     {
         var responses = ReadOnlyResponses();
-        responses["GET /app/installations/102/repositories?per_page=100"] = Response(HttpStatusCode.OK,
+        responses["GET /installation/repositories?per_page=100#2"] = Response(HttpStatusCode.OK,
             "{\"total_count\":2,\"repositories\":[{\"id\":1463547883,\"full_name\":\"StudyOrg88/AgentRelay-v2-sandbox\"},{\"id\":99,\"full_name\":\"StudyOrg88/other\"}]}");
-        var transport = new GitHubRestBootstrapTransport(new HttpClient(new ScriptedHandler(responses)), "read-token", StageOneConfig());
+        var transport = ReadOnlyTransport(new ScriptedHandler(responses));
 
         await Assert.ThrowsAsync<GitHubTransportException>(() => transport.ReadEvidenceAsync(ReadRequest(), CancellationToken.None));
     }
@@ -208,8 +264,21 @@ public sealed class GitHubRestTransportTests
     public async Task ReadOnlyRejectsUnreadableRoleInstallationScope()
     {
         var responses = ReadOnlyResponses();
-        responses["GET /app/installations/101/repositories?per_page=100"] = Response(HttpStatusCode.Forbidden, "{}");
-        var transport = new GitHubRestBootstrapTransport(new HttpClient(new ScriptedHandler(responses)), "read-token", StageOneConfig());
+        responses["GET /installation/repositories?per_page=100#1"] = Response(HttpStatusCode.Forbidden, "{}");
+        var transport = ReadOnlyTransport(new ScriptedHandler(responses));
+
+        await Assert.ThrowsAsync<GitHubTransportException>(() => transport.ReadEvidenceAsync(ReadRequest(), CancellationToken.None));
+    }
+
+    [Theory]
+    [InlineData("{\"total_count\":0,\"repositories\":[]}")]
+    [InlineData("{\"total_count\":1,\"repositories\":[{\"id\":99,\"full_name\":\"StudyOrg88/AgentRelay-v2-sandbox\"}]}")]
+    [InlineData("{\"total_count\":1,\"repositories\":[{\"id\":1463547883,\"full_name\":\"StudyOrg88/other\"}]}")]
+    public async Task ReadOnlyRejectsEmptyOrMismatchedRoleInstallationScope(string scope)
+    {
+        var responses = ReadOnlyResponses();
+        responses["GET /installation/repositories?per_page=100#3"] = Response(HttpStatusCode.OK, scope);
+        var transport = ReadOnlyTransport(new ScriptedHandler(responses));
 
         await Assert.ThrowsAsync<GitHubTransportException>(() => transport.ReadEvidenceAsync(ReadRequest(), CancellationToken.None));
     }
@@ -522,6 +591,38 @@ public sealed class GitHubRestTransportTests
         5826689, 5826708, 5826720, 5826750, 5827575,
         "refs/heads/agentrelay-control", "refs/heads/agentrelay-locks/v2_bootstrap_probe");
 
+    private static GitHubRestBootstrapTransport ReadOnlyTransport(HttpMessageHandler handler)
+        => new(new HttpClient(handler), new StageOneGitHubCredentials("github_pat_config_read_only", InstallationScopeTokens()), StageOneConfig());
+
+    private static Dictionary<long, string> InstallationScopeTokens() => new()
+    {
+        [5826689] = "ghs_reviewer_scope",
+        [5826708] = "ghs_gate_scope",
+        [5826720] = "ghs_merge_scope",
+        [5826750] = "ghs_worker_scope",
+        [5827575] = "ghs_orchestrator_scope"
+    };
+
+    private static string[] ReadOnlyCredentialNames() =>
+    [
+        "AGENTRELAY_TOKEN_SANDBOX_CONFIG",
+        "AGENTRELAY_TOKEN_SANDBOX_SCOPE_REVIEWER",
+        "AGENTRELAY_TOKEN_SANDBOX_SCOPE_GATE",
+        "AGENTRELAY_TOKEN_SANDBOX_SCOPE_MERGE",
+        "AGENTRELAY_TOKEN_SANDBOX_SCOPE_WORKER",
+        "AGENTRELAY_TOKEN_SANDBOX_SCOPE_ORCHESTRATOR"
+    ];
+
+    private static Dictionary<string, string> ReadOnlyCredentialEnvironment() => new()
+    {
+        ["AGENTRELAY_TOKEN_SANDBOX_CONFIG"] = "github_pat_config_read_only",
+        ["AGENTRELAY_TOKEN_SANDBOX_SCOPE_REVIEWER"] = "ghs_reviewer_scope",
+        ["AGENTRELAY_TOKEN_SANDBOX_SCOPE_GATE"] = "ghs_gate_scope",
+        ["AGENTRELAY_TOKEN_SANDBOX_SCOPE_MERGE"] = "ghs_merge_scope",
+        ["AGENTRELAY_TOKEN_SANDBOX_SCOPE_WORKER"] = "ghs_worker_scope",
+        ["AGENTRELAY_TOKEN_SANDBOX_SCOPE_ORCHESTRATOR"] = "ghs_orchestrator_scope"
+    };
+
     private static Dictionary<string, HttpResponseMessage> ReadOnlyResponses(string headRuns = "[]", string mergeRuns = "[{\"name\":\"sandbox-contract\",\"status\":\"completed\",\"conclusion\":\"success\",\"head_sha\":\"725dc8bbc799947dd733e10e76d23f67796c16c7\",\"app\":{\"id\":15368}}]", bool strict = true, string? head = null, string? mergeSha = null, string? installations = null)
     {
         var responses = new Dictionary<string, HttpResponseMessage>
@@ -535,8 +636,8 @@ public sealed class GitHubRestTransportTests
         ["GET /repos/StudyOrg88/AgentRelay-v2-sandbox/rulesets?per_page=100"] = Response(HttpStatusCode.OK, "[]"),
         ["GET /repos/StudyOrg88/AgentRelay-v2-sandbox/installations?per_page=100"] = Response(HttpStatusCode.OK, installations ?? InstallationsJson())
     };
-        foreach (var id in new long[] { 101, 102, 103, 104, 105 })
-            responses[$"GET /app/installations/{id}/repositories?per_page=100"] = Response(HttpStatusCode.OK, InstallationRepositoriesJson());
+        for (var request = 1; request <= 5; request++)
+            responses[$"GET /installation/repositories?per_page=100#{request}"] = Response(HttpStatusCode.OK, InstallationRepositoriesJson());
         return responses;
     }
 

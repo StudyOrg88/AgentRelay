@@ -10,6 +10,7 @@ public sealed class GitHubRestBootstrapTransport : IGitHubBootstrapTransport
     private const string ApiBase = "https://api.github.com";
     private readonly HttpClient _client;
     private readonly StageOneGitHubConfig _config;
+    private readonly IReadOnlyDictionary<long, string> _installationScopeTokens = new Dictionary<long, string>();
     private readonly ActiveProbeAuthorization? _authorization;
     private readonly bool _activeEnabled;
 
@@ -25,6 +26,12 @@ public sealed class GitHubRestBootstrapTransport : IGitHubBootstrapTransport
         _authorization = authorization;
         if (activeEnabled && !IsValidAuthorization(authorization, config))
             throw new ArgumentException("Valid stage-two authorization is required for active transport.", nameof(authorization));
+    }
+
+    public GitHubRestBootstrapTransport(HttpClient client, StageOneGitHubCredentials credentials, StageOneGitHubConfig config)
+        : this(client, credentials.ConfigurationToken, config)
+    {
+        _installationScopeTokens = credentials.InstallationScopeTokens;
     }
 
     public async Task<BootstrapEvidence?> ReadEvidenceAsync(BootstrapProbeRequest request, CancellationToken cancellationToken)
@@ -276,6 +283,13 @@ public sealed class GitHubRestBootstrapTransport : IGitHubBootstrapTransport
         return document.RootElement.Clone();
     }
 
+    private async Task<JsonElement> GetJsonAsync(string path, string token, CancellationToken cancellationToken)
+    {
+        using var response = await SendAsync(HttpMethod.Get, path, null, token, cancellationToken).ConfigureAwait(false);
+        using var document = await ReadSuccessfulJsonAsync(response, cancellationToken).ConfigureAwait(false);
+        return document.RootElement.Clone();
+    }
+
     private async Task<JsonElement?> GetOptionalJsonAsync(string path, CancellationToken cancellationToken)
     {
         using var response = await SendAsync(HttpMethod.Get, path, null, cancellationToken).ConfigureAwait(false);
@@ -285,8 +299,12 @@ public sealed class GitHubRestBootstrapTransport : IGitHubBootstrapTransport
     }
 
     private async Task<HttpResponseMessage> SendAsync(HttpMethod method, string path, string? body, CancellationToken cancellationToken)
+        => await SendAsync(method, path, body, null, cancellationToken).ConfigureAwait(false);
+
+    private async Task<HttpResponseMessage> SendAsync(HttpMethod method, string path, string? body, string? token, CancellationToken cancellationToken)
     {
         using var request = new HttpRequestMessage(method, path);
+        if (token is not null) request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
         if (body is not null) request.Content = new StringContent(body, Encoding.UTF8, "application/json");
         try { return await _client.SendAsync(request, cancellationToken).ConfigureAwait(false); }
         catch (Exception) when (!cancellationToken.IsCancellationRequested) { throw Failure(null); }
@@ -333,7 +351,7 @@ public sealed class GitHubRestBootstrapTransport : IGitHubBootstrapTransport
             var installationId = matches[0].GetProperty("id").GetInt64();
             Require(installationId > 0);
             ValidateExactPermissions(matches[0].GetProperty("permissions"), role.Value);
-            await ValidateInstallationScopeAsync(installationId, cancellationToken).ConfigureAwait(false);
+            await ValidateInstallationScopeAsync(role.Key, cancellationToken).ConfigureAwait(false);
         }
     }
 
@@ -344,9 +362,13 @@ public sealed class GitHubRestBootstrapTransport : IGitHubBootstrapTransport
             expected.TryGetValue(entry.Name, out var permission) && StringComparer.Ordinal.Equals(entry.Value.GetString(), permission)));
     }
 
-    private async Task ValidateInstallationScopeAsync(long installationId, CancellationToken cancellationToken)
+    private async Task ValidateInstallationScopeAsync(long appId, CancellationToken cancellationToken)
     {
-        var scope = await GetJsonAsync($"app/installations/{installationId}/repositories?per_page=100", cancellationToken).ConfigureAwait(false);
+        if (_installationScopeTokens.Count != 5 ||
+            !_installationScopeTokens.TryGetValue(appId, out var installationToken) ||
+            string.IsNullOrWhiteSpace(installationToken))
+            throw Failure(HttpStatusCode.Forbidden);
+        var scope = await GetJsonAsync("installation/repositories?per_page=100", installationToken, cancellationToken).ConfigureAwait(false);
         var repositories = scope.GetProperty("repositories").EnumerateArray().ToArray();
         Require(scope.GetProperty("total_count").GetInt32() == 1 && repositories.Length == 1 &&
             repositories[0].GetProperty("id").GetInt64() == _config.RepositoryId &&

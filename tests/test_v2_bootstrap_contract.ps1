@@ -4,13 +4,24 @@ $scriptPath = Join-Path $root 'scripts/invoke-v2-bootstrap-probe.ps1'
 $scriptText = Get-Content -Raw -LiteralPath $scriptPath
 
 if ($scriptText -match '(?i)--admin|--delete-branch|gh\s+pr\s+merge|ruleset|/rules') { throw 'Bootstrap script contains a forbidden merge or repository-rules operation.' }
-foreach ($required in @('AllowedTestRepositories', 'DRY_RUN', 'AuthorizationFile', 'ExpectedHead', 'TestPr', 'TestTask', 'ActiveAction', 'ActiveIdentity', 'ActiveTarget', '--active-action', '--active-identity', '--active-target', 'AGENTRELAY_TOKEN_SANDBOX_CONFIG', 'AGENTRELAY_TOKEN_REVIEWER', 'AGENTRELAY_TOKEN_GATE', 'AGENTRELAY_TOKEN_ORCHESTRATOR', 'AGENTRELAY_TOKEN_WORKER_1', 'credentialVariable', 'GH_TOKEN', "StartsWith('AGENTRELAY_TOKEN_'", 'Environment.Remove', '$process.Environment[$tokenName] = $token', 'ActiveEvidence', 'ActiveReference', 'ExpectedParent', 'Contenders', 'LiveSandbox', 'StageOneConfig', '-active-ref', '-expected-parent', '-contenders')) {
+foreach ($required in @('AllowedTestRepositories', 'DRY_RUN', 'AuthorizationFile', 'ExpectedHead', 'TestPr', 'TestTask', 'ActiveAction', 'ActiveIdentity', 'ActiveTarget', '--active-action', '--active-identity', '--active-target', 'AGENTRELAY_TOKEN_SANDBOX_CONFIG', 'AGENTRELAY_TOKEN_SANDBOX_SCOPE_REVIEWER', 'AGENTRELAY_TOKEN_SANDBOX_SCOPE_GATE', 'AGENTRELAY_TOKEN_SANDBOX_SCOPE_MERGE', 'AGENTRELAY_TOKEN_SANDBOX_SCOPE_WORKER', 'AGENTRELAY_TOKEN_SANDBOX_SCOPE_ORCHESTRATOR', 'AGENTRELAY_TOKEN_REVIEWER', 'AGENTRELAY_TOKEN_GATE', 'AGENTRELAY_TOKEN_ORCHESTRATOR', 'AGENTRELAY_TOKEN_WORKER_1', 'credentialVariable', 'credentialVariables', 'GH_TOKEN', "StartsWith('AGENTRELAY_TOKEN_'", 'Environment.Remove', '$process.Environment[$name] = $credentials[$name]', 'ActiveEvidence', 'ActiveReference', 'ExpectedParent', 'Contenders', 'LiveSandbox', 'StageOneConfig', '-active-ref', '-expected-parent', '-contenders')) {
     if ($scriptText -notmatch [regex]::Escape($required)) { throw "Bootstrap script is missing required boundary: $required" }
 }
-if ($scriptText -notmatch "Environment\['GH_TOKEN'\] = \`$token") { throw 'Selected role token must be the only token copied to GH_TOKEN.' }
+if ($scriptText -notmatch "Environment\['GH_TOKEN'\] = \`$credentials\[\`$tokenName\]") { throw 'The selected primary token must be copied to GH_TOKEN without exposing any credential.' }
 
 $dryRun = & $scriptPath -Repository 'example/test-repo' -Base main -ExpectedChecks build -ReviewerApp reviewer -GateApp gate -MergeApp merge -AllowedTestRepositories 'example/test-repo' | ConvertFrom-Json
 if ($dryRun.status -ne 'DRY_RUN' -or $dryRun.active) { throw 'Default bootstrap invocation must remain an inactive dry run.' }
+$expectedReadOnlyCredentials = @(
+    'AGENTRELAY_TOKEN_SANDBOX_CONFIG',
+    'AGENTRELAY_TOKEN_SANDBOX_SCOPE_REVIEWER',
+    'AGENTRELAY_TOKEN_SANDBOX_SCOPE_GATE',
+    'AGENTRELAY_TOKEN_SANDBOX_SCOPE_MERGE',
+    'AGENTRELAY_TOKEN_SANDBOX_SCOPE_WORKER',
+    'AGENTRELAY_TOKEN_SANDBOX_SCOPE_ORCHESTRATOR'
+)
+if (@($dryRun.credentialVariables).Count -ne $expectedReadOnlyCredentials.Count -or @($dryRun.credentialVariables | Where-Object { $_ -notin $expectedReadOnlyCredentials }).Count -ne 0) {
+    throw 'Read-only bootstrap must declare the configuration PAT plus five dedicated installation-scope credentials.'
+}
 
 $authorizationFile = [System.IO.Path]::GetTempFileName()
 Set-Content -LiteralPath $authorizationFile -Value '{}'

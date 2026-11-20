@@ -103,6 +103,10 @@ public sealed record StageOneGitHubConfig(
     string ControlReference,
     string LeaseReference);
 
+public sealed record StageOneGitHubCredentials(
+    string ConfigurationToken,
+    IReadOnlyDictionary<long, string> InstallationScopeTokens);
+
 public sealed record ProcessResult(int ExitCode, string StandardOutput, string StandardError);
 
 public sealed record GateDependencies(IGitHubApi GitHub, TextWriter DiagnosticOutput);

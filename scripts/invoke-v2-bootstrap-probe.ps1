@@ -69,24 +69,53 @@ $tokenName = if (-not $Active) { 'AGENTRELAY_TOKEN_SANDBOX_CONFIG' } else {
         default { throw 'Active action has no credential mapping.' }
     }
 }
+# Read-only credential contract:
+# - AGENTRELAY_TOKEN_SANDBOX_CONFIG is a repository-limited fine-grained PAT with
+#   only the read permissions needed for repository metadata, rules, checks, and
+#   the repository's installation list. It is never used as an App installation.
+# - Each AGENTRELAY_TOKEN_SANDBOX_SCOPE_* value is a distinct, short-lived GitHub
+#   App installation token for the named App, minted without repositories or
+#   repository_ids narrowing and permission-downscoped to read-only metadata.
+#   It is used only with GET /installation/repositories to prove the full scope.
+$scopeCredentialNames = @(
+    'AGENTRELAY_TOKEN_SANDBOX_SCOPE_REVIEWER',
+    'AGENTRELAY_TOKEN_SANDBOX_SCOPE_GATE',
+    'AGENTRELAY_TOKEN_SANDBOX_SCOPE_MERGE',
+    'AGENTRELAY_TOKEN_SANDBOX_SCOPE_WORKER',
+    'AGENTRELAY_TOKEN_SANDBOX_SCOPE_ORCHESTRATOR'
+)
+$credentialNames = if ($Active) { @($tokenName) } else { @($tokenName) + $scopeCredentialNames }
 
 if (-not $Execute) {
-    [pscustomobject]@{ status = 'DRY_RUN'; repository = $Repository; active = [bool]$Active; liveEnabled = [bool]$LiveSandbox; credentialVariable = $tokenName; arguments = [string[]]$arguments } | ConvertTo-Json -Depth 4
+    [pscustomobject]@{ status = 'DRY_RUN'; repository = $Repository; active = [bool]$Active; liveEnabled = [bool]$LiveSandbox; credentialVariable = $tokenName; credentialVariables = $credentialNames; arguments = [string[]]$arguments } | ConvertTo-Json -Depth 4
     return
 }
 
-# A single role token is selected for the child only; it is never printed or persisted.
-$token = [Environment]::GetEnvironmentVariable($tokenName, 'Process')
-if (-not $token) { $token = [Environment]::GetEnvironmentVariable($tokenName, 'User') }
-if (-not $token) { throw "$tokenName is not configured." }
+# Active execution receives one action credential. Read-only execution receives one
+# configuration PAT plus five distinct, permission-downscoped, unfiltered installation
+# tokens used only to enumerate each App installation's complete repository scope.
+$credentials = @{}
+foreach ($name in $credentialNames) {
+    $value = [Environment]::GetEnvironmentVariable($name, 'Process')
+    if (-not $value) { $value = [Environment]::GetEnvironmentVariable($name, 'User') }
+    if (-not $value) { throw "$name is not configured." }
+    $credentials[$name] = $value
+}
+if (-not $Active) {
+    if (-not $credentials[$tokenName].StartsWith('github_pat_', [System.StringComparison]::Ordinal)) { throw "$tokenName must be a fine-grained personal access token." }
+    foreach ($name in $scopeCredentialNames) {
+        if (-not $credentials[$name].StartsWith('ghs_', [System.StringComparison]::Ordinal)) { throw "$name must be an unfiltered GitHub App installation access token." }
+    }
+    if (@($scopeCredentialNames | ForEach-Object { $credentials[$_] } | Select-Object -Unique).Count -ne $scopeCredentialNames.Count) { throw 'Installation-scope credentials must be distinct.' }
+}
 
 $process = [System.Diagnostics.ProcessStartInfo]::new('dotnet')
 $process.UseShellExecute = $false
 foreach ($argument in $arguments) { [void]$process.ArgumentList.Add($argument) }
 $inheritedRoleTokens = @($process.Environment.Keys | Where-Object { $_.StartsWith('AGENTRELAY_TOKEN_', [System.StringComparison]::OrdinalIgnoreCase) })
 foreach ($name in $inheritedRoleTokens) { [void]$process.Environment.Remove($name) }
-$process.Environment[$tokenName] = $token
-$process.Environment['GH_TOKEN'] = $token
+foreach ($name in $credentialNames) { $process.Environment[$name] = $credentials[$name] }
+$process.Environment['GH_TOKEN'] = $credentials[$tokenName]
 $child = [System.Diagnostics.Process]::Start($process)
 $child.WaitForExit()
 exit $child.ExitCode

@@ -16,6 +16,7 @@ public static class Program
             var config = System.Text.Json.JsonSerializer.Deserialize<StageOneGitHubConfig>(File.ReadAllText(args[configPathIndex + 1]), JsonOptions);
             if (config is null || !IsApprovedStageOneConfig(config)) return new FailClosedGitHubApi();
             string? token;
+            StageOneGitHubCredentials? readOnlyCredentials = null;
             ActiveProbeAuthorization? activeAuthorization = null;
             var active = args.Contains("--active", StringComparer.Ordinal);
             if (active)
@@ -77,12 +78,24 @@ public static class Program
             }
             else
             {
-                token = getEnvironmentVariable("AGENTRELAY_TOKEN_SANDBOX_CONFIG");
-                if (string.IsNullOrWhiteSpace(token)) return new FailClosedGitHubApi();
+                token = getEnvironmentVariable(ConfigurationCredentialVariable);
+                if (!IsFineGrainedPersonalAccessToken(token)) return new FailClosedGitHubApi();
+                var scopeTokens = new Dictionary<long, string>();
+                foreach (var credential in InstallationScopeCredentialVariables(config))
+                {
+                    var scopeToken = getEnvironmentVariable(credential.Variable);
+                    if (!IsInstallationAccessToken(scopeToken)) return new FailClosedGitHubApi();
+                    scopeTokens[credential.AppId] = scopeToken!;
+                }
+                if (scopeTokens.Values.Distinct(StringComparer.Ordinal).Count() != scopeTokens.Count)
+                    return new FailClosedGitHubApi();
+                readOnlyCredentials = new StageOneGitHubCredentials(token!, scopeTokens);
             }
 
             var client = new HttpClient();
-            var rest = new GitHubRestBootstrapTransport(client, token, config, active, activeAuthorization);
+            var rest = active
+                ? new GitHubRestBootstrapTransport(client, token!, config, true, activeAuthorization)
+                : new GitHubRestBootstrapTransport(client, readOnlyCredentials!, config);
             return new AllowlistedGitHubApi(rest, new SystemClock());
         }
         catch (Exception) { return new FailClosedGitHubApi(); }
@@ -118,6 +131,23 @@ public static class Program
     }
 
     private static readonly System.Text.Json.JsonSerializerOptions JsonOptions = CreateJsonOptions();
+
+    private const string ConfigurationCredentialVariable = "AGENTRELAY_TOKEN_SANDBOX_CONFIG";
+
+    private static (long AppId, string Variable)[] InstallationScopeCredentialVariables(StageOneGitHubConfig config) =>
+    [
+        (config.ReviewerAppId, "AGENTRELAY_TOKEN_SANDBOX_SCOPE_REVIEWER"),
+        (config.GateAppId, "AGENTRELAY_TOKEN_SANDBOX_SCOPE_GATE"),
+        (config.MergeAppId, "AGENTRELAY_TOKEN_SANDBOX_SCOPE_MERGE"),
+        (config.WorkerAppId, "AGENTRELAY_TOKEN_SANDBOX_SCOPE_WORKER"),
+        (config.OrchestratorAppId, "AGENTRELAY_TOKEN_SANDBOX_SCOPE_ORCHESTRATOR")
+    ];
+
+    private static bool IsFineGrainedPersonalAccessToken(string? token)
+        => token?.StartsWith("github_pat_", StringComparison.Ordinal) == true;
+
+    private static bool IsInstallationAccessToken(string? token)
+        => token?.StartsWith("ghs_", StringComparison.Ordinal) == true;
 
     private static System.Text.Json.JsonSerializerOptions CreateJsonOptions()
     {
