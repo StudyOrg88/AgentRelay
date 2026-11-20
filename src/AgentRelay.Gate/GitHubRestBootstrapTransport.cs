@@ -10,7 +10,7 @@ public sealed class GitHubRestBootstrapTransport : IGitHubBootstrapTransport
     private const string ApiBase = "https://api.github.com";
     private readonly HttpClient _client;
     private readonly StageOneGitHubConfig _config;
-    private readonly IReadOnlyDictionary<long, string> _installationScopeTokens = new Dictionary<long, string>();
+    private readonly IGitHubAppJwtSigner? _jwtSigner;
     private readonly ActiveProbeAuthorization? _authorization;
     private readonly bool _activeEnabled;
 
@@ -28,10 +28,10 @@ public sealed class GitHubRestBootstrapTransport : IGitHubBootstrapTransport
             throw new ArgumentException("Valid stage-two authorization is required for active transport.", nameof(authorization));
     }
 
-    public GitHubRestBootstrapTransport(HttpClient client, StageOneGitHubCredentials credentials, StageOneGitHubConfig config)
-        : this(client, credentials.ConfigurationToken, config)
+    public GitHubRestBootstrapTransport(HttpClient client, string token, StageOneGitHubConfig config, IGitHubAppJwtSigner jwtSigner)
+        : this(client, token, config)
     {
-        _installationScopeTokens = credentials.InstallationScopeTokens;
+        _jwtSigner = jwtSigner ?? throw new ArgumentNullException(nameof(jwtSigner));
     }
 
     public async Task<BootstrapEvidence?> ReadEvidenceAsync(BootstrapProbeRequest request, CancellationToken cancellationToken)
@@ -43,6 +43,7 @@ public sealed class GitHubRestBootstrapTransport : IGitHubBootstrapTransport
 
     private async Task<BootstrapEvidence?> ReadEvidenceCoreAsync(BootstrapProbeRequest request, CancellationToken cancellationToken)
     {
+        Require(_jwtSigner is not null);
         EnsureRepository(request.Repository);
         if (request.Base != "main" || !request.ExpectedChecks.SequenceEqual([_config.RequiredCheck], StringComparer.Ordinal))
             throw Failure(HttpStatusCode.Forbidden);
@@ -335,13 +336,13 @@ public sealed class GitHubRestBootstrapTransport : IGitHubBootstrapTransport
     private async Task ValidateRoleInstallationsAsync(JsonElement installations, CancellationToken cancellationToken)
     {
         var items = installations.GetProperty("installations").EnumerateArray().ToArray();
-        var expected = new Dictionary<long, IReadOnlyDictionary<string, string>>
+        var expected = new Dictionary<long, (long InstallationId, IReadOnlyDictionary<string, string> Permissions)>
         {
-            [_config.ReviewerAppId] = new Dictionary<string, string> { ["metadata"] = "read", ["pull_requests"] = "write" },
-            [_config.GateAppId] = new Dictionary<string, string> { ["metadata"] = "read", ["contents"] = "read", ["pull_requests"] = "read", ["checks"] = "write" },
-            [_config.MergeAppId] = new Dictionary<string, string> { ["metadata"] = "read", ["contents"] = "write", ["pull_requests"] = "write" },
-            [_config.WorkerAppId] = new Dictionary<string, string> { ["metadata"] = "read", ["contents"] = "read", ["pull_requests"] = "read" },
-            [_config.OrchestratorAppId] = new Dictionary<string, string> { ["metadata"] = "read", ["contents"] = "write" }
+            [_config.ReviewerAppId] = (_config.ReviewerInstallationId, new Dictionary<string, string> { ["metadata"] = "read", ["pull_requests"] = "write" }),
+            [_config.GateAppId] = (_config.GateInstallationId, new Dictionary<string, string> { ["metadata"] = "read", ["contents"] = "read", ["pull_requests"] = "read", ["checks"] = "write" }),
+            [_config.MergeAppId] = (_config.MergeInstallationId, new Dictionary<string, string> { ["metadata"] = "read", ["contents"] = "write", ["pull_requests"] = "write" }),
+            [_config.WorkerAppId] = (_config.WorkerInstallationId, new Dictionary<string, string> { ["metadata"] = "read", ["contents"] = "read", ["pull_requests"] = "read" }),
+            [_config.OrchestratorAppId] = (_config.OrchestratorInstallationId, new Dictionary<string, string> { ["metadata"] = "read", ["contents"] = "write" })
         };
         Require(items.Length == expected.Count);
         foreach (var role in expected)
@@ -349,9 +350,9 @@ public sealed class GitHubRestBootstrapTransport : IGitHubBootstrapTransport
             var matches = items.Where(item => item.GetProperty("app_id").GetInt64() == role.Key).ToArray();
             Require(matches.Length == 1 && matches[0].GetProperty("repository_selection").GetString() == "selected");
             var installationId = matches[0].GetProperty("id").GetInt64();
-            Require(installationId > 0);
-            ValidateExactPermissions(matches[0].GetProperty("permissions"), role.Value);
-            await ValidateInstallationScopeAsync(role.Key, cancellationToken).ConfigureAwait(false);
+            Require(installationId == role.Value.InstallationId);
+            ValidateExactPermissions(matches[0].GetProperty("permissions"), role.Value.Permissions);
+            await ValidateInstallationScopeAsync(role.Key, installationId, cancellationToken).ConfigureAwait(false);
         }
     }
 
@@ -362,17 +363,47 @@ public sealed class GitHubRestBootstrapTransport : IGitHubBootstrapTransport
             expected.TryGetValue(entry.Name, out var permission) && StringComparer.Ordinal.Equals(entry.Value.GetString(), permission)));
     }
 
-    private async Task ValidateInstallationScopeAsync(long appId, CancellationToken cancellationToken)
+    private async Task ValidateInstallationScopeAsync(long appId, long installationId, CancellationToken cancellationToken)
     {
-        if (_installationScopeTokens.Count != 5 ||
-            !_installationScopeTokens.TryGetValue(appId, out var installationToken) ||
-            string.IsNullOrWhiteSpace(installationToken))
-            throw Failure(HttpStatusCode.Forbidden);
-        var scope = await GetJsonAsync("installation/repositories?per_page=100", installationToken, cancellationToken).ConfigureAwait(false);
+        using var installationToken = await MintInstallationTokenAsync(appId, installationId, cancellationToken).ConfigureAwait(false);
+        var scope = await GetJsonAsync("installation/repositories?per_page=100", installationToken.Reveal(), cancellationToken).ConfigureAwait(false);
         var repositories = scope.GetProperty("repositories").EnumerateArray().ToArray();
         Require(scope.GetProperty("total_count").GetInt32() == 1 && repositories.Length == 1 &&
             repositories[0].GetProperty("id").GetInt64() == _config.RepositoryId &&
             repositories[0].GetProperty("full_name").GetString() == AllowlistedGitHubApi.SandboxRepository);
+    }
+
+    private async Task<EphemeralSecret> MintInstallationTokenAsync(long appId, long installationId, CancellationToken cancellationToken)
+    {
+        var now = DateTimeOffset.UtcNow;
+        var signingRequest = new GitHubAppJwtRequest(
+            appId,
+            installationId,
+            _config.RepositoryId,
+            AllowlistedGitHubApi.SandboxRepository,
+            now.AddSeconds(-30),
+            now.AddMinutes(8));
+        var mintBody = JsonSerializer.Serialize(new { permissions = new { metadata = "read" } });
+        HttpResponseMessage mintResponse;
+        using (var signedJwt = await _jwtSigner!.SignAsync(signingRequest, cancellationToken).ConfigureAwait(false))
+        {
+            if (signedJwt is null || signedJwt.Binding != signingRequest) throw Failure(HttpStatusCode.Forbidden);
+            mintResponse = await SendAsync(
+                HttpMethod.Post,
+                $"app/installations/{installationId}/access_tokens",
+                mintBody,
+                signedJwt.Token.Reveal(),
+                cancellationToken).ConfigureAwait(false);
+        }
+        using var mintResponseLifetime = mintResponse;
+        using var mintDocument = await ReadSuccessfulJsonAsync(mintResponse, cancellationToken).ConfigureAwait(false);
+        var mint = mintDocument.RootElement;
+        var token = mint.GetProperty("token").GetString();
+        Require(!string.IsNullOrWhiteSpace(token) &&
+            DateTimeOffset.TryParse(mint.GetProperty("expires_at").GetString(), out var expiresAt) && expiresAt > DateTimeOffset.UtcNow &&
+            mint.GetProperty("repository_selection").GetString() == "selected");
+        ValidateExactPermissions(mint.GetProperty("permissions"), new Dictionary<string, string> { ["metadata"] = "read" });
+        return new EphemeralSecret(token!);
     }
 
     private void EnsureActiveBinding(ActiveProbeRequest request)

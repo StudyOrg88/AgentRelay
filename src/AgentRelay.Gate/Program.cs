@@ -5,7 +5,10 @@ public static class Program
     public static Task<int> Main(string[] args)
         => GateCli.RunAsync(args, new GateDependencies(CreateGitHubApi(args, Environment.GetEnvironmentVariable), Console.Error), Console.Out, Console.Error, CancellationToken.None);
 
-    public static IGitHubApi CreateGitHubApi(string[] args, Func<string, string?> getEnvironmentVariable)
+    public static IGitHubApi CreateGitHubApi(
+        string[] args,
+        Func<string, string?> getEnvironmentVariable,
+        IGitHubAppJwtSigner? jwtSigner = null)
     {
         if (!args.Contains("--live-sandbox", StringComparer.Ordinal)) return new FailClosedGitHubApi();
         var configPathIndex = Array.IndexOf(args, "--stage-one-config");
@@ -16,7 +19,6 @@ public static class Program
             var config = System.Text.Json.JsonSerializer.Deserialize<StageOneGitHubConfig>(File.ReadAllText(args[configPathIndex + 1]), JsonOptions);
             if (config is null || !IsApprovedStageOneConfig(config)) return new FailClosedGitHubApi();
             string? token;
-            StageOneGitHubCredentials? readOnlyCredentials = null;
             ActiveProbeAuthorization? activeAuthorization = null;
             var active = args.Contains("--active", StringComparer.Ordinal);
             if (active)
@@ -78,24 +80,15 @@ public static class Program
             }
             else
             {
+                if (jwtSigner is null) return new FailClosedGitHubApi();
                 token = getEnvironmentVariable(ConfigurationCredentialVariable);
                 if (!IsFineGrainedPersonalAccessToken(token)) return new FailClosedGitHubApi();
-                var scopeTokens = new Dictionary<long, string>();
-                foreach (var credential in InstallationScopeCredentialVariables(config))
-                {
-                    var scopeToken = getEnvironmentVariable(credential.Variable);
-                    if (!IsInstallationAccessToken(scopeToken)) return new FailClosedGitHubApi();
-                    scopeTokens[credential.AppId] = scopeToken!;
-                }
-                if (scopeTokens.Values.Distinct(StringComparer.Ordinal).Count() != scopeTokens.Count)
-                    return new FailClosedGitHubApi();
-                readOnlyCredentials = new StageOneGitHubCredentials(token!, scopeTokens);
             }
 
             var client = new HttpClient();
             var rest = active
                 ? new GitHubRestBootstrapTransport(client, token!, config, true, activeAuthorization)
-                : new GitHubRestBootstrapTransport(client, readOnlyCredentials!, config);
+                : new GitHubRestBootstrapTransport(client, token!, config, jwtSigner!);
             return new AllowlistedGitHubApi(rest, new SystemClock());
         }
         catch (Exception) { return new FailClosedGitHubApi(); }
@@ -134,20 +127,8 @@ public static class Program
 
     private const string ConfigurationCredentialVariable = "AGENTRELAY_TOKEN_SANDBOX_CONFIG";
 
-    private static (long AppId, string Variable)[] InstallationScopeCredentialVariables(StageOneGitHubConfig config) =>
-    [
-        (config.ReviewerAppId, "AGENTRELAY_TOKEN_SANDBOX_SCOPE_REVIEWER"),
-        (config.GateAppId, "AGENTRELAY_TOKEN_SANDBOX_SCOPE_GATE"),
-        (config.MergeAppId, "AGENTRELAY_TOKEN_SANDBOX_SCOPE_MERGE"),
-        (config.WorkerAppId, "AGENTRELAY_TOKEN_SANDBOX_SCOPE_WORKER"),
-        (config.OrchestratorAppId, "AGENTRELAY_TOKEN_SANDBOX_SCOPE_ORCHESTRATOR")
-    ];
-
     private static bool IsFineGrainedPersonalAccessToken(string? token)
         => token?.StartsWith("github_pat_", StringComparison.Ordinal) == true;
-
-    private static bool IsInstallationAccessToken(string? token)
-        => token?.StartsWith("ghs_", StringComparison.Ordinal) == true;
 
     private static System.Text.Json.JsonSerializerOptions CreateJsonOptions()
     {
@@ -161,5 +142,6 @@ public static class Program
            config.HeadSha == "354099dbca836c3cf0e01b7b4bd637279ad80fa9" && config.TestMergeSha == "725dc8bbc799947dd733e10e76d23f67796c16c7" &&
            config.RequiredCheck == "sandbox-contract" && config.RequiredCheckAppId == 15368 && config.RulesetId == 27610516 &&
            config.ReviewerAppId == 5826689 && config.GateAppId == 5826708 && config.MergeAppId == 5826720 && config.WorkerAppId == 5826750 && config.OrchestratorAppId == 5827575 &&
+           config.ReviewerInstallationId == 101 && config.GateInstallationId == 102 && config.MergeInstallationId == 103 && config.WorkerInstallationId == 104 && config.OrchestratorInstallationId == 105 &&
            config.ControlReference == "refs/heads/agentrelay-control" && config.LeaseReference == "refs/heads/agentrelay-locks/v2_bootstrap_probe";
 }

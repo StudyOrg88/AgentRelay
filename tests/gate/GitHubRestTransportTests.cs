@@ -36,21 +36,20 @@ public sealed class GitHubRestTransportTests
     }
 
     [Fact]
-    public void LiveReadOnlyTransportReadsConfigurationPatAndFiveDedicatedInstallationScopeCredentials()
+    public void LiveReadOnlyTransportRequiresTrustedLocalSignerBeforeCredentialRead()
     {
         var configPath = Path.GetTempFileName();
         try
         {
             File.WriteAllText(configPath, JsonSerializer.Serialize(StageOneConfig()));
-            var values = ReadOnlyCredentialEnvironment();
             var reads = new List<string>();
 
             var api = Program.CreateGitHubApi(
                 ["--live-sandbox", "--stage-one-config", configPath],
-                name => { reads.Add(name); return values.GetValueOrDefault(name); });
+                name => { reads.Add(name); return "github_pat_config_read_only"; });
 
-            Assert.IsType<AllowlistedGitHubApi>(api);
-            Assert.Equal(ReadOnlyCredentialNames(), reads);
+            Assert.IsType<FailClosedGitHubApi>(api);
+            Assert.Empty(reads);
         }
         finally
         {
@@ -58,22 +57,41 @@ public sealed class GitHubRestTransportTests
         }
     }
 
-    [Theory]
-    [InlineData("AGENTRELAY_TOKEN_SANDBOX_CONFIG", "ghs_wrong-kind")]
-    [InlineData("AGENTRELAY_TOKEN_SANDBOX_SCOPE_GATE", "github_pat_wrong_kind")]
-    [InlineData("AGENTRELAY_TOKEN_SANDBOX_SCOPE_GATE", "ghs_reviewer_scope")]
-    public void LiveReadOnlyTransportFailsClosedOnWrongOrSharedCredentialKind(string variable, string replacement)
+    [Fact]
+    public void LiveReadOnlyTransportReadsOnlyConfigurationPatWhenTrustedSignerIsProvided()
     {
         var configPath = Path.GetTempFileName();
         try
         {
             File.WriteAllText(configPath, JsonSerializer.Serialize(StageOneConfig()));
-            var values = ReadOnlyCredentialEnvironment();
-            values[variable] = replacement;
+            var reads = new List<string>();
 
             var api = Program.CreateGitHubApi(
                 ["--live-sandbox", "--stage-one-config", configPath],
-                name => values.GetValueOrDefault(name));
+                name => { reads.Add(name); return "github_pat_config_read_only"; },
+                new FakeGitHubAppJwtSigner());
+
+            Assert.IsType<AllowlistedGitHubApi>(api);
+            Assert.Equal(["AGENTRELAY_TOKEN_SANDBOX_CONFIG"], reads);
+        }
+        finally
+        {
+            File.Delete(configPath);
+        }
+    }
+
+    [Fact]
+    public void LiveReadOnlyTransportRejectsWrongConfigurationCredentialKind()
+    {
+        var configPath = Path.GetTempFileName();
+        try
+        {
+            File.WriteAllText(configPath, JsonSerializer.Serialize(StageOneConfig()));
+
+            var api = Program.CreateGitHubApi(
+                ["--live-sandbox", "--stage-one-config", configPath],
+                _ => "ghs_not_a_configuration_pat",
+                new FakeGitHubAppJwtSigner());
 
             Assert.IsType<FailClosedGitHubApi>(api);
         }
@@ -147,6 +165,17 @@ public sealed class GitHubRestTransportTests
     }
 
     [Fact]
+    public async Task ReadOnlyTransportWithoutTrustedSignerFailsBeforeNetworkAccess()
+    {
+        var handler = new ScriptedHandler(ReadOnlyResponses());
+        var transport = new GitHubRestBootstrapTransport(new HttpClient(handler), "github_pat_config_read_only", StageOneConfig());
+
+        await Assert.ThrowsAsync<GitHubTransportException>(() => transport.ReadEvidenceAsync(ReadRequest(), CancellationToken.None));
+
+        Assert.Empty(handler.Requests);
+    }
+
+    [Fact]
     public async Task ActiveOperationCannotChangeEvidenceFromStageTwoAuthorization()
     {
         var handler = new ScriptedHandler(new Dictionary<string, HttpResponseMessage>());
@@ -163,7 +192,8 @@ public sealed class GitHubRestTransportTests
     public async Task ReadOnlyVerifiesExactStageOneFactsAndSources()
     {
         var handler = new ScriptedHandler(ReadOnlyResponses());
-        var transport = ReadOnlyTransport(handler);
+        var signer = new FakeGitHubAppJwtSigner();
+        var transport = ReadOnlyTransport(handler, signer);
 
         var evidence = await transport.ReadEvidenceAsync(ReadRequest(), CancellationToken.None);
 
@@ -171,15 +201,63 @@ public sealed class GitHubRestTransportTests
         Assert.Equal(new[] { "sandbox-contract" }, evidence.ExpectedChecks);
         Assert.Equal(TestMerge, evidence.GateTargetCommit);
         Assert.All(handler.Requests, request => Assert.Equal("Bearer", request.Authorization?.Scheme));
-        Assert.DoesNotContain(handler.Requests, request => request.Method != HttpMethod.Get);
+        Assert.DoesNotContain(handler.Requests, request => request.Method != HttpMethod.Get && request.Method != HttpMethod.Post);
+        Assert.Equal(
+            [
+                "/app/installations/101/access_tokens",
+                "/app/installations/102/access_tokens",
+                "/app/installations/103/access_tokens",
+                "/app/installations/104/access_tokens",
+                "/app/installations/105/access_tokens"
+            ],
+            handler.Requests.Where(request => request.Method == HttpMethod.Post).Select(request => request.Path));
+        Assert.Equal(
+            [
+                "jwt-5826689-101",
+                "jwt-5826708-102",
+                "jwt-5826720-103",
+                "jwt-5826750-104",
+                "jwt-5827575-105"
+            ],
+            handler.Requests.Where(request => request.Method == HttpMethod.Post).Select(request => request.Authorization?.Parameter));
+        foreach (var body in handler.Requests.Zip(handler.Bodies).Where(pair => pair.First.Method == HttpMethod.Post).Select(pair => pair.Second))
+        {
+            using var json = JsonDocument.Parse(body);
+            Assert.False(json.RootElement.TryGetProperty("repositories", out _));
+            Assert.False(json.RootElement.TryGetProperty("repository_ids", out _));
+            Assert.Equal("read", json.RootElement.GetProperty("permissions").GetProperty("metadata").GetString());
+            Assert.Single(json.RootElement.GetProperty("permissions").EnumerateObject());
+        }
         Assert.Equal(5, handler.Requests.Count(request => request.Path == "/installation/repositories?per_page=100"));
-        Assert.DoesNotContain(handler.Requests, request => request.Path.StartsWith("/app/installations/", StringComparison.Ordinal));
-        Assert.Equal(InstallationScopeTokens().Values.Order(), handler.Requests
-            .Where(request => request.Path == "/installation/repositories?per_page=100")
-            .Select(request => request.Authorization?.Parameter)
-            .Order());
-        Assert.All(handler.Requests.Where(request => request.Path != "/installation/repositories?per_page=100"),
+        Assert.DoesNotContain(handler.Requests, request => request.Path.StartsWith("/app/installations/", StringComparison.Ordinal) && request.Path.Contains("/repositories", StringComparison.Ordinal));
+        Assert.Equal(
+            [
+                "minted-5826689-101",
+                "minted-5826708-102",
+                "minted-5826720-103",
+                "minted-5826750-104",
+                "minted-5827575-105"
+            ],
+            handler.Requests.Where(request => request.Path == "/installation/repositories?per_page=100").Select(request => request.Authorization?.Parameter));
+        Assert.All(handler.Requests.Where(request => request.Method == HttpMethod.Get && request.Path != "/installation/repositories?per_page=100"),
             request => Assert.Equal("github_pat_config_read_only", request.Authorization?.Parameter));
+        Assert.Equal(
+            [
+                (5826689L, 101L),
+                (5826708L, 102L),
+                (5826720L, 103L),
+                (5826750L, 104L),
+                (5827575L, 105L)
+            ],
+            signer.Requests.Select(request => (request.AppId, request.InstallationId)));
+        Assert.All(signer.Requests, request =>
+        {
+            Assert.Equal(1463547883, request.RepositoryId);
+            Assert.Equal(Repository, request.RepositoryFullName);
+            Assert.True(request.IssuedAt < request.ExpiresAt);
+            Assert.InRange(request.ExpiresAt - request.IssuedAt, TimeSpan.Zero, TimeSpan.FromMinutes(9));
+        });
+        Assert.All(signer.Secrets, secret => Assert.Throws<ObjectDisposedException>(() => secret.Reveal()));
     }
 
     [Theory]
@@ -278,6 +356,71 @@ public sealed class GitHubRestTransportTests
     {
         var responses = ReadOnlyResponses();
         responses["GET /installation/repositories?per_page=100#3"] = Response(HttpStatusCode.OK, scope);
+        var transport = ReadOnlyTransport(new ScriptedHandler(responses));
+
+        await Assert.ThrowsAsync<GitHubTransportException>(() => transport.ReadEvidenceAsync(ReadRequest(), CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task ReadOnlyRejectsInstallationIdThatDoesNotMatchStageOneConfigBeforeMint()
+    {
+        var installations = InstallationsJson().Replace("\"id\":101,\"app_id\":5826689", "\"id\":999,\"app_id\":5826689", StringComparison.Ordinal);
+        var signer = new FakeGitHubAppJwtSigner();
+        var transport = ReadOnlyTransport(new ScriptedHandler(ReadOnlyResponses(installations: installations)), signer);
+
+        await Assert.ThrowsAsync<GitHubTransportException>(() => transport.ReadEvidenceAsync(ReadRequest(), CancellationToken.None));
+
+        Assert.Empty(signer.Requests);
+    }
+
+    [Theory]
+    [InlineData("app")]
+    [InlineData("installation")]
+    [InlineData("repository-id")]
+    [InlineData("repository-name")]
+    [InlineData("issued-at")]
+    [InlineData("expires-at")]
+    public async Task ReadOnlyRejectsSignerBindingMismatchBeforeMint(string mismatch)
+    {
+        var signer = new FakeGitHubAppJwtSigner(request => request with
+        {
+            AppId = mismatch == "app" ? request.AppId + 1 : request.AppId,
+            InstallationId = mismatch == "installation" ? request.InstallationId + 1 : request.InstallationId,
+            RepositoryId = mismatch == "repository-id" ? request.RepositoryId + 1 : request.RepositoryId,
+            RepositoryFullName = mismatch == "repository-name" ? "StudyOrg88/other" : request.RepositoryFullName,
+            IssuedAt = mismatch == "issued-at" ? request.IssuedAt.AddSeconds(1) : request.IssuedAt,
+            ExpiresAt = mismatch == "expires-at" ? request.ExpiresAt.AddSeconds(1) : request.ExpiresAt
+        });
+        var handler = new ScriptedHandler(ReadOnlyResponses());
+        var transport = ReadOnlyTransport(handler, signer);
+
+        await Assert.ThrowsAsync<GitHubTransportException>(() => transport.ReadEvidenceAsync(ReadRequest(), CancellationToken.None));
+
+        Assert.DoesNotContain(handler.Requests, request => request.Method == HttpMethod.Post);
+        Assert.All(signer.Secrets, secret => Assert.Throws<ObjectDisposedException>(() => secret.Reveal()));
+    }
+
+    [Fact]
+    public async Task ReadOnlyRejectsForbiddenInstallationTokenMint()
+    {
+        var responses = ReadOnlyResponses();
+        responses["POST /app/installations/101/access_tokens"] = Response(HttpStatusCode.Forbidden, "{}");
+        var transport = ReadOnlyTransport(new ScriptedHandler(responses));
+
+        await Assert.ThrowsAsync<GitHubTransportException>(() => transport.ReadEvidenceAsync(ReadRequest(), CancellationToken.None));
+    }
+
+    [Theory]
+    [InlineData("{\"expires_at\":\"2099-01-01T00:00:00Z\",\"permissions\":{\"metadata\":\"read\"},\"repository_selection\":\"selected\"}")]
+    [InlineData("{\"token\":\"\",\"expires_at\":\"2099-01-01T00:00:00Z\",\"permissions\":{\"metadata\":\"read\"},\"repository_selection\":\"selected\"}")]
+    [InlineData("{\"token\":\"minted-5826689-101\",\"expires_at\":\"2000-01-01T00:00:00Z\",\"permissions\":{\"metadata\":\"read\"},\"repository_selection\":\"selected\"}")]
+    [InlineData("{\"token\":\"minted-5826689-101\",\"expires_at\":\"2099-01-01T00:00:00Z\",\"permissions\":{\"metadata\":\"write\"},\"repository_selection\":\"selected\"}")]
+    [InlineData("{\"token\":\"minted-5826689-101\",\"expires_at\":\"2099-01-01T00:00:00Z\",\"permissions\":{\"metadata\":\"read\",\"checks\":\"write\"},\"repository_selection\":\"selected\"}")]
+    [InlineData("{\"token\":\"minted-5826689-101\",\"expires_at\":\"2099-01-01T00:00:00Z\",\"permissions\":{\"metadata\":\"read\"},\"repository_selection\":\"all\"}")]
+    public async Task ReadOnlyRejectsInvalidInstallationTokenMintResponse(string response)
+    {
+        var responses = ReadOnlyResponses();
+        responses["POST /app/installations/101/access_tokens"] = Response(HttpStatusCode.Created, response);
         var transport = ReadOnlyTransport(new ScriptedHandler(responses));
 
         await Assert.ThrowsAsync<GitHubTransportException>(() => transport.ReadEvidenceAsync(ReadRequest(), CancellationToken.None));
@@ -589,39 +732,11 @@ public sealed class GitHubRestTransportTests
     private static StageOneGitHubConfig StageOneConfig() => new(
         1463547883, 1, Head, TestMerge, "sandbox-contract", 15368, 27610516,
         5826689, 5826708, 5826720, 5826750, 5827575,
+        101, 102, 103, 104, 105,
         "refs/heads/agentrelay-control", "refs/heads/agentrelay-locks/v2_bootstrap_probe");
 
-    private static GitHubRestBootstrapTransport ReadOnlyTransport(HttpMessageHandler handler)
-        => new(new HttpClient(handler), new StageOneGitHubCredentials("github_pat_config_read_only", InstallationScopeTokens()), StageOneConfig());
-
-    private static Dictionary<long, string> InstallationScopeTokens() => new()
-    {
-        [5826689] = "ghs_reviewer_scope",
-        [5826708] = "ghs_gate_scope",
-        [5826720] = "ghs_merge_scope",
-        [5826750] = "ghs_worker_scope",
-        [5827575] = "ghs_orchestrator_scope"
-    };
-
-    private static string[] ReadOnlyCredentialNames() =>
-    [
-        "AGENTRELAY_TOKEN_SANDBOX_CONFIG",
-        "AGENTRELAY_TOKEN_SANDBOX_SCOPE_REVIEWER",
-        "AGENTRELAY_TOKEN_SANDBOX_SCOPE_GATE",
-        "AGENTRELAY_TOKEN_SANDBOX_SCOPE_MERGE",
-        "AGENTRELAY_TOKEN_SANDBOX_SCOPE_WORKER",
-        "AGENTRELAY_TOKEN_SANDBOX_SCOPE_ORCHESTRATOR"
-    ];
-
-    private static Dictionary<string, string> ReadOnlyCredentialEnvironment() => new()
-    {
-        ["AGENTRELAY_TOKEN_SANDBOX_CONFIG"] = "github_pat_config_read_only",
-        ["AGENTRELAY_TOKEN_SANDBOX_SCOPE_REVIEWER"] = "ghs_reviewer_scope",
-        ["AGENTRELAY_TOKEN_SANDBOX_SCOPE_GATE"] = "ghs_gate_scope",
-        ["AGENTRELAY_TOKEN_SANDBOX_SCOPE_MERGE"] = "ghs_merge_scope",
-        ["AGENTRELAY_TOKEN_SANDBOX_SCOPE_WORKER"] = "ghs_worker_scope",
-        ["AGENTRELAY_TOKEN_SANDBOX_SCOPE_ORCHESTRATOR"] = "ghs_orchestrator_scope"
-    };
+    private static GitHubRestBootstrapTransport ReadOnlyTransport(HttpMessageHandler handler, IGitHubAppJwtSigner? signer = null)
+        => new(new HttpClient(handler), "github_pat_config_read_only", StageOneConfig(), signer ?? new FakeGitHubAppJwtSigner());
 
     private static Dictionary<string, HttpResponseMessage> ReadOnlyResponses(string headRuns = "[]", string mergeRuns = "[{\"name\":\"sandbox-contract\",\"status\":\"completed\",\"conclusion\":\"success\",\"head_sha\":\"725dc8bbc799947dd733e10e76d23f67796c16c7\",\"app\":{\"id\":15368}}]", bool strict = true, string? head = null, string? mergeSha = null, string? installations = null)
     {
@@ -634,7 +749,12 @@ public sealed class GitHubRestTransportTests
         ["GET /repos/StudyOrg88/AgentRelay-v2-sandbox/branches/main/protection"] = Response(HttpStatusCode.OK, "{\"required_status_checks\":{\"strict\":" + strict.ToString().ToLowerInvariant() + ",\"checks\":[{\"context\":\"sandbox-contract\",\"app_id\":15368}]},\"enforce_admins\":{\"enabled\":true},\"allow_force_pushes\":{\"enabled\":false},\"allow_deletions\":{\"enabled\":false}}") ,
         ["GET /repos/StudyOrg88/AgentRelay-v2-sandbox/rulesets/27610516"] = Response(HttpStatusCode.OK, RulesetJson()),
         ["GET /repos/StudyOrg88/AgentRelay-v2-sandbox/rulesets?per_page=100"] = Response(HttpStatusCode.OK, "[]"),
-        ["GET /repos/StudyOrg88/AgentRelay-v2-sandbox/installations?per_page=100"] = Response(HttpStatusCode.OK, installations ?? InstallationsJson())
+        ["GET /repos/StudyOrg88/AgentRelay-v2-sandbox/installations?per_page=100"] = Response(HttpStatusCode.OK, installations ?? InstallationsJson()),
+        ["POST /app/installations/101/access_tokens"] = Response(HttpStatusCode.Created, MintTokenJson(5826689, 101)),
+        ["POST /app/installations/102/access_tokens"] = Response(HttpStatusCode.Created, MintTokenJson(5826708, 102)),
+        ["POST /app/installations/103/access_tokens"] = Response(HttpStatusCode.Created, MintTokenJson(5826720, 103)),
+        ["POST /app/installations/104/access_tokens"] = Response(HttpStatusCode.Created, MintTokenJson(5826750, 104)),
+        ["POST /app/installations/105/access_tokens"] = Response(HttpStatusCode.Created, MintTokenJson(5827575, 105))
     };
         for (var request = 1; request <= 5; request++)
             responses[$"GET /installation/repositories?per_page=100#{request}"] = Response(HttpStatusCode.OK, InstallationRepositoriesJson());
@@ -668,6 +788,9 @@ public sealed class GitHubRestTransportTests
 
     private static string InstallationRepositoriesJson() => "{\"total_count\":1,\"repositories\":[{\"id\":1463547883,\"full_name\":\"StudyOrg88/AgentRelay-v2-sandbox\"}]}";
 
+    private static string MintTokenJson(long appId, long installationId)
+        => "{\"token\":\"minted-" + appId + "-" + installationId + "\",\"expires_at\":\"2099-01-01T00:00:00Z\",\"permissions\":{\"metadata\":\"read\"},\"repository_selection\":\"selected\"}";
+
     private static Dictionary<string, HttpResponseMessage> WorkerNegativeResponses() => new()
     {
         ["GET /installation/repositories"] = Response(HttpStatusCode.OK, "{\"repositories\":[{\"id\":1463547883,\"full_name\":\"StudyOrg88/AgentRelay-v2-sandbox\",\"permissions\":{\"contents\":\"read\",\"pull_requests\":\"read\",\"metadata\":\"read\"}}]}"),
@@ -678,6 +801,21 @@ public sealed class GitHubRestTransportTests
         ["PATCH /repos/StudyOrg88/AgentRelay-v2-sandbox/git/refs/heads/agentrelay-control"] = Response(HttpStatusCode.Forbidden, "{\"message\":\"forbidden\"}"),
         ["PATCH /repos/StudyOrg88/AgentRelay-v2-sandbox/git/refs/heads/agentrelay-locks/v2_bootstrap_probe"] = Response(HttpStatusCode.Forbidden, "{\"message\":\"forbidden\"}")
     };
+
+    private sealed class FakeGitHubAppJwtSigner(Func<GitHubAppJwtRequest, GitHubAppJwtRequest>? signedBinding = null) : IGitHubAppJwtSigner
+    {
+        public List<GitHubAppJwtRequest> Requests { get; } = [];
+        public List<EphemeralSecret> Secrets { get; } = [];
+
+        public Task<SignedGitHubAppJwt> SignAsync(GitHubAppJwtRequest request, CancellationToken cancellationToken)
+        {
+            Requests.Add(request);
+            var binding = signedBinding?.Invoke(request) ?? request;
+            var secret = new EphemeralSecret($"jwt-{binding.AppId}-{binding.InstallationId}");
+            Secrets.Add(secret);
+            return Task.FromResult(new SignedGitHubAppJwt(binding, secret));
+        }
+    }
 
     private sealed class ScriptedHandler(Dictionary<string, HttpResponseMessage> responses) : HttpMessageHandler
     {

@@ -100,12 +100,55 @@ public sealed record StageOneGitHubConfig(
     long MergeAppId,
     long WorkerAppId,
     long OrchestratorAppId,
+    long ReviewerInstallationId,
+    long GateInstallationId,
+    long MergeInstallationId,
+    long WorkerInstallationId,
+    long OrchestratorInstallationId,
     string ControlReference,
     string LeaseReference);
 
-public sealed record StageOneGitHubCredentials(
-    string ConfigurationToken,
-    IReadOnlyDictionary<long, string> InstallationScopeTokens);
+public sealed record GitHubAppJwtRequest(
+    long AppId,
+    long InstallationId,
+    long RepositoryId,
+    string RepositoryFullName,
+    DateTimeOffset IssuedAt,
+    DateTimeOffset ExpiresAt);
+
+public interface IGitHubAppJwtSigner
+{
+    Task<SignedGitHubAppJwt> SignAsync(GitHubAppJwtRequest request, CancellationToken cancellationToken);
+}
+
+public sealed record SignedGitHubAppJwt(GitHubAppJwtRequest Binding, EphemeralSecret Token) : IDisposable
+{
+    public void Dispose() => Token.Dispose();
+}
+
+public sealed class EphemeralSecret : IDisposable
+{
+    private char[]? _value;
+
+    public EphemeralSecret(string value)
+    {
+        if (string.IsNullOrWhiteSpace(value)) throw new ArgumentException("Secret must not be empty.", nameof(value));
+        _value = value.ToCharArray();
+    }
+
+    public string Reveal()
+    {
+        var value = _value ?? throw new ObjectDisposedException(nameof(EphemeralSecret));
+        return new string(value);
+    }
+
+    public void Dispose()
+    {
+        if (_value is not { } value) return;
+        Array.Clear(value, 0, value.Length);
+        _value = null;
+    }
+}
 
 public sealed record ProcessResult(int ExitCode, string StandardOutput, string StandardError);
 
