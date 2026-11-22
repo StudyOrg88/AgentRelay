@@ -1,5 +1,6 @@
 using System.Net;
 using System.Net.Http.Headers;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using AgentRelay.Gate;
@@ -49,7 +50,7 @@ public sealed class GitHubRestTransportTests
                 name => { reads.Add(name); return "github_pat_config_read_only"; });
 
             Assert.IsType<FailClosedGitHubApi>(api);
-            Assert.Empty(reads);
+            Assert.DoesNotContain("AGENTRELAY_TOKEN_SANDBOX_CONFIG", reads);
         }
         finally
         {
@@ -77,6 +78,133 @@ public sealed class GitHubRestTransportTests
         finally
         {
             File.Delete(configPath);
+        }
+    }
+
+    [Fact]
+    public async Task ProgramAssemblyPassesConfiguredLocalSignerToFakeReadOnlyMintEndpoints()
+    {
+        var configPath = Path.GetTempFileName();
+        var keyPaths = new List<string>();
+        try
+        {
+            File.WriteAllText(configPath, JsonSerializer.Serialize(StageOneConfig()));
+            var environment = LocalSignerEnvironment();
+            foreach (var role in new[] { "REVIEWER", "GATE", "MERGE", "WORKER", "ORCHESTRATOR" })
+            {
+                using var key = RSA.Create(2048);
+                var keyPath = Path.GetTempFileName();
+                keyPaths.Add(keyPath);
+                File.WriteAllText(keyPath, key.ExportPkcs8PrivateKeyPem());
+                environment[$"AGENTRELAY_APP_{role}_KEY_PATH"] = keyPath;
+            }
+            environment["AGENTRELAY_TOKEN_SANDBOX_CONFIG"] = "github_pat_config_read_only";
+            var reads = new List<string>();
+            var handler = new ScriptedHandler(ReadOnlyResponses());
+
+            var api = Program.CreateGitHubApi(
+                ["--live-sandbox", "--stage-one-config", configPath],
+                name => { reads.Add(name); return environment.GetValueOrDefault(name); },
+                httpClient: new HttpClient(handler) { BaseAddress = new Uri("https://api.github.com/") });
+
+            Assert.IsType<AllowlistedGitHubApi>(api);
+            var evidence = await api.ReadBootstrapEvidenceAsync(ReadRequest(), CancellationToken.None);
+            Assert.True(evidence.PermissionsKnown);
+            Assert.Contains("AGENTRELAY_TOKEN_SANDBOX_CONFIG", reads);
+            Assert.All(LocalSignerEnvironment().Keys, name => Assert.Contains(name, reads));
+            var mintRequests = handler.Requests
+                .Where(request => request.Method == HttpMethod.Post && request.Path.StartsWith("/app/installations/", StringComparison.Ordinal))
+                .ToArray();
+            Assert.Equal(
+                [
+                    "/app/installations/183537068/access_tokens",
+                    "/app/installations/183537205/access_tokens",
+                    "/app/installations/183537266/access_tokens",
+                    "/app/installations/183537328/access_tokens",
+                    "/app/installations/183553703/access_tokens"
+                ],
+                mintRequests.Select(request => request.Path));
+            Assert.Equal([5826689L, 5826708L, 5826720L, 5826750L, 5827575L], mintRequests.Select(request =>
+            {
+                var jwt = request.Authorization?.Parameter?.Split('.') ?? [];
+                Assert.Equal(3, jwt.Length);
+                using var claims = JsonDocument.Parse(DecodeBase64Url(jwt[1]));
+                return claims.RootElement.GetProperty("iss").GetInt64();
+            }));
+        }
+        finally
+        {
+            File.Delete(configPath);
+            foreach (var keyPath in keyPaths) File.Delete(keyPath);
+        }
+    }
+
+    [Fact]
+    public void ProgramAcceptsIssueRecordedStageOneInstallationIds()
+    {
+        var configPath = Path.GetTempFileName();
+        try
+        {
+            File.WriteAllText(configPath, JsonSerializer.Serialize(StageOneConfig()));
+
+            var api = Program.CreateGitHubApi(
+                ["--live-sandbox", "--stage-one-config", configPath],
+                name => name == "AGENTRELAY_TOKEN_SANDBOX_CONFIG" ? "github_pat_config_read_only" : null,
+                new FakeGitHubAppJwtSigner());
+
+            Assert.IsType<AllowlistedGitHubApi>(api);
+        }
+        finally
+        {
+            File.Delete(configPath);
+        }
+    }
+
+    [Fact]
+    public void LocalSignerRejectsUnapprovedStageOneInstallationMapping()
+    {
+        var environment = LocalSignerEnvironment();
+
+        var signer = LocalGitHubAppJwtSigner.TryCreate(
+            StageOneConfig() with { ReviewerInstallationId = 999 },
+            environment.GetValueOrDefault);
+
+        Assert.Null(signer);
+    }
+
+    [Fact]
+    public async Task ConfiguredLocalSignerProducesValidBoundAppJwt()
+    {
+        using var key = RSA.Create(2048);
+        var keyPath = Path.GetTempFileName();
+        try
+        {
+            File.WriteAllText(keyPath, key.ExportPkcs8PrivateKeyPem());
+            var environment = LocalSignerEnvironment();
+            environment["AGENTRELAY_APP_REVIEWER_KEY_PATH"] = keyPath;
+            var signer = LocalGitHubAppJwtSigner.TryCreate(StageOneConfig(), environment.GetValueOrDefault);
+            Assert.NotNull(signer);
+            var now = DateTimeOffset.UtcNow;
+            var request = new GitHubAppJwtRequest(5826689, 183537068, 1463547883, Repository, now.AddSeconds(-30), now.AddMinutes(8));
+
+            using var signed = await signer!.SignAsync(request, CancellationToken.None);
+
+            Assert.Equal(request, signed.Binding);
+            var parts = signed.Token.Reveal().Split('.');
+            Assert.Equal(3, parts.Length);
+            Assert.True(key.VerifyData(
+                Encoding.ASCII.GetBytes(parts[0] + "." + parts[1]),
+                DecodeBase64Url(parts[2]),
+                HashAlgorithmName.SHA256,
+                RSASignaturePadding.Pkcs1));
+            using var header = JsonDocument.Parse(DecodeBase64Url(parts[0]));
+            using var claims = JsonDocument.Parse(DecodeBase64Url(parts[1]));
+            Assert.Equal("RS256", header.RootElement.GetProperty("alg").GetString());
+            Assert.Equal(5826689, claims.RootElement.GetProperty("iss").GetInt64());
+        }
+        finally
+        {
+            File.Delete(keyPath);
         }
     }
 
@@ -176,6 +304,20 @@ public sealed class GitHubRestTransportTests
     }
 
     [Fact]
+    public async Task ReadOnlySignerFailureFailsClosedBeforeTokenMint()
+    {
+        var handler = new ScriptedHandler(ReadOnlyResponses());
+        var api = new AllowlistedGitHubApi(
+            ReadOnlyTransport(handler, new ThrowingGitHubAppJwtSigner()),
+            new SystemClock());
+
+        var error = await Assert.ThrowsAsync<GitHubApiException>(() => api.ReadBootstrapEvidenceAsync(ReadRequest(), CancellationToken.None));
+
+        Assert.Equal("github_evidence_unavailable", error.SafeReason);
+        Assert.DoesNotContain(handler.Requests, request => request.Method == HttpMethod.Post && request.Path.StartsWith("/app/installations/", StringComparison.Ordinal));
+    }
+
+    [Fact]
     public async Task ActiveOperationCannotChangeEvidenceFromStageTwoAuthorization()
     {
         var handler = new ScriptedHandler(new Dictionary<string, HttpResponseMessage>());
@@ -204,20 +346,20 @@ public sealed class GitHubRestTransportTests
         Assert.DoesNotContain(handler.Requests, request => request.Method != HttpMethod.Get && request.Method != HttpMethod.Post);
         Assert.Equal(
             [
-                "/app/installations/101/access_tokens",
-                "/app/installations/102/access_tokens",
-                "/app/installations/103/access_tokens",
-                "/app/installations/104/access_tokens",
-                "/app/installations/105/access_tokens"
+                "/app/installations/183537068/access_tokens",
+                "/app/installations/183537205/access_tokens",
+                "/app/installations/183537266/access_tokens",
+                "/app/installations/183537328/access_tokens",
+                "/app/installations/183553703/access_tokens"
             ],
             handler.Requests.Where(request => request.Method == HttpMethod.Post).Select(request => request.Path));
         Assert.Equal(
             [
-                "jwt-5826689-101",
-                "jwt-5826708-102",
-                "jwt-5826720-103",
-                "jwt-5826750-104",
-                "jwt-5827575-105"
+                "jwt-5826689-183537068",
+                "jwt-5826708-183537205",
+                "jwt-5826720-183537266",
+                "jwt-5826750-183537328",
+                "jwt-5827575-183553703"
             ],
             handler.Requests.Where(request => request.Method == HttpMethod.Post).Select(request => request.Authorization?.Parameter));
         foreach (var body in handler.Requests.Zip(handler.Bodies).Where(pair => pair.First.Method == HttpMethod.Post).Select(pair => pair.Second))
@@ -232,22 +374,22 @@ public sealed class GitHubRestTransportTests
         Assert.DoesNotContain(handler.Requests, request => request.Path.StartsWith("/app/installations/", StringComparison.Ordinal) && request.Path.Contains("/repositories", StringComparison.Ordinal));
         Assert.Equal(
             [
-                "minted-5826689-101",
-                "minted-5826708-102",
-                "minted-5826720-103",
-                "minted-5826750-104",
-                "minted-5827575-105"
+                "minted-5826689-183537068",
+                "minted-5826708-183537205",
+                "minted-5826720-183537266",
+                "minted-5826750-183537328",
+                "minted-5827575-183553703"
             ],
             handler.Requests.Where(request => request.Path == "/installation/repositories?per_page=100").Select(request => request.Authorization?.Parameter));
         Assert.All(handler.Requests.Where(request => request.Method == HttpMethod.Get && request.Path != "/installation/repositories?per_page=100"),
             request => Assert.Equal("github_pat_config_read_only", request.Authorization?.Parameter));
         Assert.Equal(
             [
-                (5826689L, 101L),
-                (5826708L, 102L),
-                (5826720L, 103L),
-                (5826750L, 104L),
-                (5827575L, 105L)
+                (5826689L, 183537068L),
+                (5826708L, 183537205L),
+                (5826720L, 183537266L),
+                (5826750L, 183537328L),
+                (5827575L, 183553703L)
             ],
             signer.Requests.Select(request => (request.AppId, request.InstallationId)));
         Assert.All(signer.Requests, request =>
@@ -364,7 +506,7 @@ public sealed class GitHubRestTransportTests
     [Fact]
     public async Task ReadOnlyRejectsInstallationIdThatDoesNotMatchStageOneConfigBeforeMint()
     {
-        var installations = InstallationsJson().Replace("\"id\":101,\"app_id\":5826689", "\"id\":999,\"app_id\":5826689", StringComparison.Ordinal);
+        var installations = InstallationsJson().Replace("\"id\":183537068,\"app_id\":5826689", "\"id\":999,\"app_id\":5826689", StringComparison.Ordinal);
         var signer = new FakeGitHubAppJwtSigner();
         var transport = ReadOnlyTransport(new ScriptedHandler(ReadOnlyResponses(installations: installations)), signer);
 
@@ -404,7 +546,7 @@ public sealed class GitHubRestTransportTests
     public async Task ReadOnlyRejectsForbiddenInstallationTokenMint()
     {
         var responses = ReadOnlyResponses();
-        responses["POST /app/installations/101/access_tokens"] = Response(HttpStatusCode.Forbidden, "{}");
+        responses["POST /app/installations/183537068/access_tokens"] = Response(HttpStatusCode.Forbidden, "{}");
         var transport = ReadOnlyTransport(new ScriptedHandler(responses));
 
         await Assert.ThrowsAsync<GitHubTransportException>(() => transport.ReadEvidenceAsync(ReadRequest(), CancellationToken.None));
@@ -413,14 +555,14 @@ public sealed class GitHubRestTransportTests
     [Theory]
     [InlineData("{\"expires_at\":\"2099-01-01T00:00:00Z\",\"permissions\":{\"metadata\":\"read\"},\"repository_selection\":\"selected\"}")]
     [InlineData("{\"token\":\"\",\"expires_at\":\"2099-01-01T00:00:00Z\",\"permissions\":{\"metadata\":\"read\"},\"repository_selection\":\"selected\"}")]
-    [InlineData("{\"token\":\"minted-5826689-101\",\"expires_at\":\"2000-01-01T00:00:00Z\",\"permissions\":{\"metadata\":\"read\"},\"repository_selection\":\"selected\"}")]
-    [InlineData("{\"token\":\"minted-5826689-101\",\"expires_at\":\"2099-01-01T00:00:00Z\",\"permissions\":{\"metadata\":\"write\"},\"repository_selection\":\"selected\"}")]
-    [InlineData("{\"token\":\"minted-5826689-101\",\"expires_at\":\"2099-01-01T00:00:00Z\",\"permissions\":{\"metadata\":\"read\",\"checks\":\"write\"},\"repository_selection\":\"selected\"}")]
-    [InlineData("{\"token\":\"minted-5826689-101\",\"expires_at\":\"2099-01-01T00:00:00Z\",\"permissions\":{\"metadata\":\"read\"},\"repository_selection\":\"all\"}")]
+    [InlineData("{\"token\":\"minted-5826689-183537068\",\"expires_at\":\"2000-01-01T00:00:00Z\",\"permissions\":{\"metadata\":\"read\"},\"repository_selection\":\"selected\"}")]
+    [InlineData("{\"token\":\"minted-5826689-183537068\",\"expires_at\":\"2099-01-01T00:00:00Z\",\"permissions\":{\"metadata\":\"write\"},\"repository_selection\":\"selected\"}")]
+    [InlineData("{\"token\":\"minted-5826689-183537068\",\"expires_at\":\"2099-01-01T00:00:00Z\",\"permissions\":{\"metadata\":\"read\",\"checks\":\"write\"},\"repository_selection\":\"selected\"}")]
+    [InlineData("{\"token\":\"minted-5826689-183537068\",\"expires_at\":\"2099-01-01T00:00:00Z\",\"permissions\":{\"metadata\":\"read\"},\"repository_selection\":\"all\"}")]
     public async Task ReadOnlyRejectsInvalidInstallationTokenMintResponse(string response)
     {
         var responses = ReadOnlyResponses();
-        responses["POST /app/installations/101/access_tokens"] = Response(HttpStatusCode.Created, response);
+        responses["POST /app/installations/183537068/access_tokens"] = Response(HttpStatusCode.Created, response);
         var transport = ReadOnlyTransport(new ScriptedHandler(responses));
 
         await Assert.ThrowsAsync<GitHubTransportException>(() => transport.ReadEvidenceAsync(ReadRequest(), CancellationToken.None));
@@ -732,8 +874,28 @@ public sealed class GitHubRestTransportTests
     private static StageOneGitHubConfig StageOneConfig() => new(
         1463547883, 1, Head, TestMerge, "sandbox-contract", 15368, 27610516,
         5826689, 5826708, 5826720, 5826750, 5827575,
-        101, 102, 103, 104, 105,
+        183537068, 183537205, 183537266, 183537328, 183553703,
         "refs/heads/agentrelay-control", "refs/heads/agentrelay-locks/v2_bootstrap_probe");
+
+    private static Dictionary<string, string?> LocalSignerEnvironment() => new()
+    {
+        ["AGENTRELAY_APP_REVIEWER_ID"] = "5826689",
+        ["AGENTRELAY_APP_REVIEWER_KEY_PATH"] = "C:\\sandbox-tests\\reviewer.pem",
+        ["AGENTRELAY_APP_GATE_ID"] = "5826708",
+        ["AGENTRELAY_APP_GATE_KEY_PATH"] = "C:\\sandbox-tests\\gate.pem",
+        ["AGENTRELAY_APP_MERGE_ID"] = "5826720",
+        ["AGENTRELAY_APP_MERGE_KEY_PATH"] = "C:\\sandbox-tests\\merge.pem",
+        ["AGENTRELAY_APP_WORKER_ID"] = "5826750",
+        ["AGENTRELAY_APP_WORKER_KEY_PATH"] = "C:\\sandbox-tests\\worker.pem",
+        ["AGENTRELAY_APP_ORCHESTRATOR_ID"] = "5827575",
+        ["AGENTRELAY_APP_ORCHESTRATOR_KEY_PATH"] = "C:\\sandbox-tests\\orchestrator.pem"
+    };
+
+    private static byte[] DecodeBase64Url(string value)
+    {
+        var base64 = value.Replace('-', '+').Replace('_', '/');
+        return Convert.FromBase64String(base64 + new string('=', (4 - base64.Length % 4) % 4));
+    }
 
     private static GitHubRestBootstrapTransport ReadOnlyTransport(HttpMessageHandler handler, IGitHubAppJwtSigner? signer = null)
         => new(new HttpClient(handler), "github_pat_config_read_only", StageOneConfig(), signer ?? new FakeGitHubAppJwtSigner());
@@ -750,11 +912,11 @@ public sealed class GitHubRestTransportTests
         ["GET /repos/StudyOrg88/AgentRelay-v2-sandbox/rulesets/27610516"] = Response(HttpStatusCode.OK, RulesetJson()),
         ["GET /repos/StudyOrg88/AgentRelay-v2-sandbox/rulesets?per_page=100"] = Response(HttpStatusCode.OK, "[]"),
         ["GET /repos/StudyOrg88/AgentRelay-v2-sandbox/installations?per_page=100"] = Response(HttpStatusCode.OK, installations ?? InstallationsJson()),
-        ["POST /app/installations/101/access_tokens"] = Response(HttpStatusCode.Created, MintTokenJson(5826689, 101)),
-        ["POST /app/installations/102/access_tokens"] = Response(HttpStatusCode.Created, MintTokenJson(5826708, 102)),
-        ["POST /app/installations/103/access_tokens"] = Response(HttpStatusCode.Created, MintTokenJson(5826720, 103)),
-        ["POST /app/installations/104/access_tokens"] = Response(HttpStatusCode.Created, MintTokenJson(5826750, 104)),
-        ["POST /app/installations/105/access_tokens"] = Response(HttpStatusCode.Created, MintTokenJson(5827575, 105))
+        ["POST /app/installations/183537068/access_tokens"] = Response(HttpStatusCode.Created, MintTokenJson(5826689, 183537068)),
+        ["POST /app/installations/183537205/access_tokens"] = Response(HttpStatusCode.Created, MintTokenJson(5826708, 183537205)),
+        ["POST /app/installations/183537266/access_tokens"] = Response(HttpStatusCode.Created, MintTokenJson(5826720, 183537266)),
+        ["POST /app/installations/183537328/access_tokens"] = Response(HttpStatusCode.Created, MintTokenJson(5826750, 183537328)),
+        ["POST /app/installations/183553703/access_tokens"] = Response(HttpStatusCode.Created, MintTokenJson(5827575, 183553703))
     };
         for (var request = 1; request <= 5; request++)
             responses[$"GET /installation/repositories?per_page=100#{request}"] = Response(HttpStatusCode.OK, InstallationRepositoriesJson());
@@ -780,11 +942,11 @@ public sealed class GitHubRestTransportTests
     private static string RulesetJson() => "{\"id\":27610516,\"enforcement\":\"active\",\"conditions\":{\"ref_name\":{\"include\":[\"refs/heads/agentrelay-control\",\"refs/heads/agentrelay-locks/**\"]}},\"bypass_actors\":[{\"actor_id\":5827575,\"actor_type\":\"Integration\",\"bypass_mode\":\"always\"}],\"rules\":[{\"type\":\"creation\"},{\"type\":\"update\"},{\"type\":\"deletion\"},{\"type\":\"non_fast_forward\"}]}";
 
     private static string InstallationsJson() => "{\"installations\":[" +
-        "{\"id\":101,\"app_id\":5826689,\"repository_selection\":\"selected\",\"permissions\":{\"metadata\":\"read\",\"pull_requests\":\"write\"}}," +
-        "{\"id\":102,\"app_id\":5826708,\"repository_selection\":\"selected\",\"permissions\":{\"metadata\":\"read\",\"contents\":\"read\",\"pull_requests\":\"read\",\"checks\":\"write\"}}," +
-        "{\"id\":103,\"app_id\":5826720,\"repository_selection\":\"selected\",\"permissions\":{\"metadata\":\"read\",\"contents\":\"write\",\"pull_requests\":\"write\"}}," +
-        "{\"id\":104,\"app_id\":5826750,\"repository_selection\":\"selected\",\"permissions\":{\"metadata\":\"read\",\"contents\":\"read\",\"pull_requests\":\"read\"}}," +
-        "{\"id\":105,\"app_id\":5827575,\"repository_selection\":\"selected\",\"permissions\":{\"metadata\":\"read\",\"contents\":\"write\"}}]}";
+        "{\"id\":183537068,\"app_id\":5826689,\"repository_selection\":\"selected\",\"permissions\":{\"metadata\":\"read\",\"pull_requests\":\"write\"}}," +
+        "{\"id\":183537205,\"app_id\":5826708,\"repository_selection\":\"selected\",\"permissions\":{\"metadata\":\"read\",\"contents\":\"read\",\"pull_requests\":\"read\",\"checks\":\"write\"}}," +
+        "{\"id\":183537266,\"app_id\":5826720,\"repository_selection\":\"selected\",\"permissions\":{\"metadata\":\"read\",\"contents\":\"write\",\"pull_requests\":\"write\"}}," +
+        "{\"id\":183537328,\"app_id\":5826750,\"repository_selection\":\"selected\",\"permissions\":{\"metadata\":\"read\",\"contents\":\"read\",\"pull_requests\":\"read\"}}," +
+        "{\"id\":183553703,\"app_id\":5827575,\"repository_selection\":\"selected\",\"permissions\":{\"metadata\":\"read\",\"contents\":\"write\"}}]}";
 
     private static string InstallationRepositoriesJson() => "{\"total_count\":1,\"repositories\":[{\"id\":1463547883,\"full_name\":\"StudyOrg88/AgentRelay-v2-sandbox\"}]}";
 
@@ -815,6 +977,12 @@ public sealed class GitHubRestTransportTests
             Secrets.Add(secret);
             return Task.FromResult(new SignedGitHubAppJwt(binding, secret));
         }
+    }
+
+    private sealed class ThrowingGitHubAppJwtSigner : IGitHubAppJwtSigner
+    {
+        public Task<SignedGitHubAppJwt> SignAsync(GitHubAppJwtRequest request, CancellationToken cancellationToken)
+            => Task.FromException<SignedGitHubAppJwt>(new InvalidOperationException("signing failed"));
     }
 
     private sealed class ScriptedHandler(Dictionary<string, HttpResponseMessage> responses) : HttpMessageHandler

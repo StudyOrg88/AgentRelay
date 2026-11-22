@@ -8,7 +8,8 @@ public static class Program
     public static IGitHubApi CreateGitHubApi(
         string[] args,
         Func<string, string?> getEnvironmentVariable,
-        IGitHubAppJwtSigner? jwtSigner = null)
+        IGitHubAppJwtSigner? jwtSigner = null,
+        HttpClient? httpClient = null)
     {
         if (!args.Contains("--live-sandbox", StringComparer.Ordinal)) return new FailClosedGitHubApi();
         var configPathIndex = Array.IndexOf(args, "--stage-one-config");
@@ -80,12 +81,13 @@ public static class Program
             }
             else
             {
+                jwtSigner ??= LocalGitHubAppJwtSigner.TryCreate(config, getEnvironmentVariable);
                 if (jwtSigner is null) return new FailClosedGitHubApi();
                 token = getEnvironmentVariable(ConfigurationCredentialVariable);
                 if (!IsFineGrainedPersonalAccessToken(token)) return new FailClosedGitHubApi();
             }
 
-            var client = new HttpClient();
+            var client = httpClient ?? new HttpClient();
             var rest = active
                 ? new GitHubRestBootstrapTransport(client, token!, config, true, activeAuthorization)
                 : new GitHubRestBootstrapTransport(client, token!, config, jwtSigner!);
@@ -137,11 +139,11 @@ public static class Program
         return options;
     }
 
-    private static bool IsApprovedStageOneConfig(StageOneGitHubConfig config)
+    internal static bool IsApprovedStageOneConfig(StageOneGitHubConfig config)
         => config.RepositoryId == 1463547883 && config.PullRequest == 1 &&
            config.HeadSha == "354099dbca836c3cf0e01b7b4bd637279ad80fa9" && config.TestMergeSha == "725dc8bbc799947dd733e10e76d23f67796c16c7" &&
            config.RequiredCheck == "sandbox-contract" && config.RequiredCheckAppId == 15368 && config.RulesetId == 27610516 &&
            config.ReviewerAppId == 5826689 && config.GateAppId == 5826708 && config.MergeAppId == 5826720 && config.WorkerAppId == 5826750 && config.OrchestratorAppId == 5827575 &&
-           config.ReviewerInstallationId == 101 && config.GateInstallationId == 102 && config.MergeInstallationId == 103 && config.WorkerInstallationId == 104 && config.OrchestratorInstallationId == 105 &&
+           config.ReviewerInstallationId == 183537068 && config.GateInstallationId == 183537205 && config.MergeInstallationId == 183537266 && config.WorkerInstallationId == 183537328 && config.OrchestratorInstallationId == 183553703 &&
            config.ControlReference == "refs/heads/agentrelay-control" && config.LeaseReference == "refs/heads/agentrelay-locks/v2_bootstrap_probe";
 }
